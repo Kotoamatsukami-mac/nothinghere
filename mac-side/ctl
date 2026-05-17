@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# mac-side/ctl — Slice 1 controller
+#
+# Resolves phone identity from profile, checks mesh reachability,
+# SSHes to Termux, runs the phone agent, prints clean output.
+#
+# Usage:
+#   ctl [ping|status]         — uses default profile (nothing-3a-pro)
+#   NHERE_PROFILE=<name> ctl  — override profile
+#
+# Slice 1 commands:
+#   ping    verify Tailscale mesh + SSH reachability
+#   status  collect and print phone state
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+PROFILE="${NHERE_PROFILE:-nothing-3a-pro}"
+PROFILE_FILE="$REPO_ROOT/profiles/$PROFILE.conf"
+
+if [[ ! -f "$PROFILE_FILE" ]]; then
+  echo "error: profile not found: $PROFILE_FILE" >&2
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$PROFILE_FILE"
+
+: "${NHERE_HOST:?profile must define NHERE_HOST}"
+: "${NHERE_PORT:?profile must define NHERE_PORT}"
+: "${NHERE_USER:?profile must define NHERE_USER}"
+
+AGENT_PATH="${NHERE_AGENT_PATH:-~/nhere/agent}"
+CMD="${1:-status}"
+
+# SSH options shared across calls
+SSH_OPTS=(
+  -o BatchMode=yes
+  -o StrictHostKeyChecking=accept-new
+  -o ConnectTimeout=8
+  -p "$NHERE_PORT"
+)
+
+# Check mesh reachability.
+# Prefers tailscale ping (network-layer, no shell). Falls back to SSH probe.
+check_mesh() {
+  if command -v tailscale &>/dev/null; then
+    if tailscale ping -c 1 --timeout 5s "$NHERE_HOST" &>/dev/null; then
+      return 0
+    fi
+    echo "warn: tailscale ping failed — trying SSH probe" >&2
+  fi
+  ssh "${SSH_OPTS[@]}" "$NHERE_USER@$NHERE_HOST" true 2>/dev/null
+}
+
+case "$CMD" in
+  ping)
+    if check_mesh; then
+      echo "reachable   $NHERE_HOST :$NHERE_PORT"
+    else
+      echo "unreachable $NHERE_HOST" >&2
+      exit 1
+    fi
+    ;;
+
+  status)
+    if ! check_mesh; then
+      echo "error: cannot reach $NHERE_HOST — check Tailscale and sshd on phone" >&2
+      exit 1
+    fi
+    echo "--- $PROFILE ---"
+    ssh "${SSH_OPTS[@]}" "$NHERE_USER@$NHERE_HOST" "sh $AGENT_PATH status"
+    ;;
+
+  *)
+    echo "usage: ctl [ping|status]" >&2
+    exit 1
+    ;;
+esac

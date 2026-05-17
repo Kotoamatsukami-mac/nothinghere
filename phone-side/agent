@@ -1,0 +1,80 @@
+#!/bin/sh
+# phone-side/agent — Slice 1 phone agent
+#
+# Deploy to ~/nhere/agent on the phone. chmod +x after deploy.
+# Non-daemon. Invoked via SSH by the Mac controller.
+#
+# Commands:
+#   ping    echo pong + timestamp — proves the chain reaches this script
+#   status  collect and print phone state; partial truth preferred over failure
+
+CMD="${1:-status}"
+
+utctime() {
+  date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u
+}
+
+battery_state() {
+  if command -v termux-battery-status >/dev/null 2>&1; then
+    bat_raw="$(termux-battery-status 2>/dev/null)"
+    if [ -z "$bat_raw" ]; then
+      echo "unknown (no output from termux-battery-status)"
+      return
+    fi
+    bat_pct="$(printf '%s' "$bat_raw" | grep -o '"percentage":[[:space:]]*[0-9]*' | grep -o '[0-9]*')"
+    bat_st="$(printf '%s' "$bat_raw" | grep -o '"status":[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/')"
+    printf '%s%% %s' "${bat_pct:---}" "${bat_st:---}"
+  else
+    echo "unknown (termux-battery-status not found)"
+  fi
+}
+
+root_state() {
+  if ! command -v su >/dev/null 2>&1; then
+    echo "unavailable (su not found)"
+    return
+  fi
+  # timeout guards against a blocking su prompt on non-rooted devices
+  root_id="$(timeout 3 su -c id 2>/dev/null | grep -o 'uid=[0-9]*' | head -1)"
+  if [ "$root_id" = "uid=0" ]; then
+    echo "available"
+  elif [ -n "$root_id" ]; then
+    echo "partial ($root_id)"
+  else
+    echo "unavailable"
+  fi
+}
+
+tailscale_state() {
+  if command -v tailscale >/dev/null 2>&1; then
+    ts_line="$(tailscale status 2>/dev/null | head -1)"
+    if [ -n "$ts_line" ]; then
+      echo "$ts_line"
+    else
+      echo "unknown (tailscale returned no output)"
+    fi
+  else
+    echo "unknown (tailscale not found)"
+  fi
+}
+
+case "$CMD" in
+  ping)
+    printf 'pong %s\n' "$(utctime)"
+    ;;
+
+  status)
+    printf 'host:       %s\n' "$(hostname 2>/dev/null || echo unknown)"
+    printf 'time:       %s\n' "$(utctime)"
+    printf 'battery:    %s\n' "$(battery_state)"
+    printf 'root:       %s\n' "$(root_state)"
+    printf 'tailscale:  %s\n' "$(tailscale_state)"
+    printf 'wakelock:   %s\n' "unknown"
+    printf 'ssh:        %s\n' "reachable (you are here)"
+    ;;
+
+  *)
+    printf 'error: unknown command: %s\n' "$CMD" >&2
+    exit 1
+    ;;
+esac
