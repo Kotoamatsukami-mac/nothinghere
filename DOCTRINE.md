@@ -1,102 +1,85 @@
-# nothinghere — Build Doctrine
+# nothinghere — Doctrine
 
-## Two Parts. No Exceptions.
+`nothinghere` is an owner-enrolled Android control deck. It is designed for devices the operator owns, has configured, and is allowed to administer.
 
----
+The project is not a camera script, not a Nothing-only toy, not a GUI experiment, and not a pile of prototype Termux tricks. It is a clean split between a controller and a phone engine. The controller decides. The phone engine stays reachable, reports state, and performs approved local actions on the enrolled phone.
 
-### A — Mac / Laptop (Controller)
-The string-pulling station. Source of truth. Where the operator lives.
+This doctrine should evolve as the build proves what is true. Update it whenever the architecture changes. Do not preserve old wording because it sounded good yesterday. Truth beats decoration.
 
-- Tauri app. Dark mode only. No light mode.
-- Neon green = connected / live. Red = offline / dead.
-- Live status panel: SSH reachability, Tailscale state, ADB state, stream state.
-- All commands fire over SSH → Tailscale → phone.
-- Screen relay: operator hits button → scrcpy spawns its own native window.
-  scrcpy is the view surface. The Tauri app is the command surface. They are not the same thing.
-- ADB TCP enabled on demand for scrcpy only. Torn down when stream ends.
-- One `git clone` + one install script. Mac/laptop has root by default. No ceremony.
+## The shape
 
----
+There are two real parts.
 
-### B — Magisk Module (Phone / Android Side)
-The silent backend. One module. Small. No bloat.
+A is the Mac or laptop controller. For v1, this is a fast terminal launcher/menu, not Tauri. The menu checks status, sends approved requests, opens native relay windows, launches browser fallback when needed, and stays out of the way. It does not become the brain. It calls the controller engine.
 
-**Sole purpose:** guarantee these four services survive boot and stay alive:
-1. Termux `sshd` on port `8022`
-2. Termux wake lock
-3. OpenSSL / crypto deps
-4. Tailscale up
+B is the phone engine. On the controlled phone, the engine is the Magisk module plus the Termux runtime working as one backend layer. Magisk provides privileged startup, service supervision, and the stable backend container. Termux provides the live userland tools: `sshd`, wake-lock helpers, shell scripts, dependencies, status checks, and the local execution surface. Do not argue Magisk-first versus Termux-first on the controlled phone. Together they are the phone engine.
 
-**Soft on/off toggle** — runtime start/stop of those four services.
-Not the Magisk disable switch (that requires reboot). A live toggle,
-controllable from A over SSH. No reboot drawback.
+The first supported phone profile is the Nothing Phone 3a Pro. That does not mean the repo is Nothing-only. The long-term shape is rooted Android with profile zero proven on the Nothing device.
 
-**Command logic lives here too** — the phone-side agent that executes
-what A tells it to. Narrow whitelist. Not an open root shell.
+Samsung/S25 controller support is parked for now. Its future shape is simple: Termux text menu, SSH requests, browser stream fallback, no heavy GUI. Do not let that distract from v1.
 
-**Android 14+ only.** No lower. Non-negotiable.
+## The authority chain
 
-**Generic Android first.** Nothing Phone 3a Pro is profile zero —
-the first polished, confirmed-working profile. Other devices slot in
-via capability detection:
+The controller should think in this order:
 
-- Can it SSH?
-- Can it get root?
-- Can it run Termux?
-- Can it run Tailscale?
-- Can it use scrcpy camera mode?
-- Does it have camera IDs?
-- Can it record screen?
-- Can it start services at boot?
-- Can it hold wake lock?
+`controller menu -> controller engine -> Tailscale identity -> SSH channel -> phone engine -> approved local action`
 
----
+Visual relay is the exception path:
 
-## Transport Layer
+`controller menu -> temporary debug bridge path over Tailscale -> scrcpy native window -> close relay path when finished`
 
-```
-Mac/S25 knocks → Tailscale finds → SSH enters → Agent verifies → Root executes → ADB wakes for visual relay only
-```
+SSH over Tailscale is the normal command channel. The debug bridge is not the normal door. It exists for scrcpy/screen relay and deliberate maintenance, then it closes again. Always-on wireless debugging at boot is prototype contamination unless a future explicit profile says otherwise.
 
-- **SSH over Tailscale** — always alive, all commands go here
-- **ADB TCP over Tailscale** — temporary, scrcpy only, closed after stream ends
-- **No hardcoded IPs anywhere** — identity by Tailscale hostname, never `100.x.x.x`
-- **No `StrictHostKeyChecking=no`** in production — pinned host keys
-- **No wireless ADB persisted at boot** — that's a prototype habit, not doctrine
+The Mac should not host a fake app just to look serious. For v1, a terminal launcher is enough. When the operator asks for screen relay, spawn `scrcpy` in its own native window. When the operator asks for web stream fallback, open the default browser. Let macOS do what it is already good at.
 
----
+Tauri is not banned. Tauri is v2 material only if the terminal controller proves the control model and a real cockpit becomes worth the weight. If Tauri ever returns, it must remain a shell over the same engine, not a second implementation of the engine.
 
-## Identity
+## Armed mode
 
-Tailscale hostnames are the only addresses that matter:
+Armed mode is not vibes. It is the phone engine intentionally ready to accept requests from approved controllers.
 
-```
-nothing-phone-3a-pro   ← phone (profile zero)
-macbook-pro            ← primary controller
-```
+A useful state model is:
 
-IP addresses are internal plumbing. Never exposed to operator config.
+`disarmed` means the phone is not controller-ready.
 
----
+`armed` means Tailscale is up, SSH is reachable, the phone engine answers status, and approved requests can run.
 
-## What Gets Binned From the ZIP
+`relay-active` means a visual relay path has been temporarily opened for scrcpy or stream viewing.
 
-- `np3a-tui.bak*` / `np3a-tui.pre-*` — old versions, gone
-- `roomcam` — superseded
-- `install-codex-native.sh` — dev addon, not core
-- `CODEX_NATIVE_TERMUX_TODO.md` — internal notes
-- Hardcoded `PHONE_IP_WIFI`, `PHONE_IP_TS`, `TU=u0_a296`, `PIN=1234`
-- `service.adb.tcp.port 5555` persisted at boot — opt-in only, never default
-- `com.nothing.camera/.activity.CameraActivity` hardcoded — moves to profile
+`degraded` means the phone is reachable but one expected service is weak or missing.
 
----
+`rescue` means the normal path failed and the operator is deliberately entering a manual recovery path.
 
-## What Carries Forward (Cleaned)
+Do not build a soft toggle that can strand the operator without a recovery path. Stopping the transport or shell service is not the same as stopping a minor helper. The phone engine needs state-aware start, stop, restart, and status behaviour before any pretty menu tries to control it.
 
-- `wakeup_count` polling pattern from wake daemon — efficient, keep
-- PID file pattern from np3a — clean process management, keep
-- `ts_peer_ip()` hostname keyword search — already identity-based, keep
-- `sshd-ctl` — solid utility, keep
-- Tailscale broadcast toggle pattern (`ts` script) — keep
-- VM tunables from `ace_sysctl_tune` — keep as separate optional perf profile
-- Boot chain structure from `service.sh` — keep, make profile-aware
+## Command scope
+
+The phone engine should expose a narrow owner-useful surface first. Start with real actions and expand only when the need is proven.
+
+The first surface should cover status, wake/sleep, service restart, visual relay preparation, diagnostics, and cleanup. Status means battery, thermal state, privileged state, Tailscale state, SSH state, wake lock, storage, and relay state. Wake/sleep means acquire or release wake lock and wake the screen when deliberately requested. Visual relay means prepare the temporary relay path, let the controller launch the viewer, then close the relay path when finished. Diagnostics means useful snapshots, not endless noise.
+
+A broad manual shell is not the default product. It can exist as a deliberate owner recovery path, clearly separated from normal menu actions.
+
+## Identity and configuration
+
+Do not build around IP addresses. Tailscale hostnames and profile names are the stable layer. IP addresses are plumbing and should not leak into operator-facing config.
+
+Private values stay private: Tailscale IPs, Wi-Fi IPs, SSH keys, host keys, device serials, local usernames, local paths, tokens, PINs, and personal hostnames when they are not meant to be shared.
+
+Reusable values belong in profiles: device family, Android version floor, camera package hints, relay capability, input-node hints, service requirements, package dependencies, and capability flags.
+
+The Nothing profile is profile zero because it is the device being proven first. It is not a licence to hardcode Nothing assumptions into the core.
+
+## What the prototype taught us
+
+The ZIP was useful because it exposed working scraps and bad habits at the same time. Treat it as evidence, not scripture.
+
+Keep the ideas that are structurally sound: wakeup polling, PID discipline, service supervision patterns, identity-based peer discovery, SSH control, Tailscale transport, and scrcpy as an external native relay surface.
+
+Bin or quarantine the prototype habits: hardcoded IPs, hardcoded Termux UID, plaintext PINs, fixed input nodes, fixed Nothing activities, backup copies as real source, old roomcam identity, localhost dashboards for no reason, always-on wireless debugging at boot, and duplicate logic across wrappers.
+
+## Working rule for agents
+
+Read before patching. Do not create duplicate variables because you did not search the existing strings. Do not promote a wrapper into the brain because it is the most visible file. Do not flatten the system into a shopping list. Follow the architecture in the subtext: controller decides, phone engine performs, transport stays private, relay wakes only when needed, config stays profile-aware.
+
+When reality contradicts this doctrine, update the doctrine and explain why. The project should get sharper as it is built, not more cluttered.
