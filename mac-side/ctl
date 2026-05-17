@@ -1,16 +1,9 @@
 #!/usr/bin/env bash
 # mac-side/ctl — Slice 1 controller
 #
-# Resolves phone identity from profile, checks mesh reachability,
-# SSHes to Termux, runs the phone agent, prints clean output.
-#
 # Usage:
-#   ctl [ping|status]         — uses default profile (nothing-3a-pro)
-#   NHERE_PROFILE=<name> ctl  — override profile
-#
-# Slice 1 commands:
-#   ping    verify Tailscale mesh + SSH reachability
-#   status  collect and print phone state
+#   ctl [ping|status]
+#   NHERE_PROFILE=<name> ctl [ping|status]
 
 set -euo pipefail
 
@@ -20,44 +13,43 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 PROFILE="${NHERE_PROFILE:-nothing-3a-pro}"
 PROFILE_FILE="$REPO_ROOT/profiles/$PROFILE.conf"
 
-if [[ ! -f "$PROFILE_FILE" ]]; then
-  echo "error: profile not found: $PROFILE_FILE" >&2
-  exit 1
-fi
-
+[[ -f "$PROFILE_FILE" ]] || { echo "error: profile not found: $PROFILE_FILE" >&2; exit 1; }
 # shellcheck source=/dev/null
 source "$PROFILE_FILE"
 
 : "${NHERE_HOST:?profile must define NHERE_HOST}"
 : "${NHERE_PORT:?profile must define NHERE_PORT}"
 : "${NHERE_USER:?profile must define NHERE_USER}"
+: "${NHERE_KEY:?profile must define NHERE_KEY}"
 
 AGENT_PATH="${NHERE_AGENT_PATH:-~/nhere/agent}"
 CMD="${1:-status}"
 
-# SSH options shared across calls
 SSH_OPTS=(
+  -i "$NHERE_KEY"
   -o BatchMode=yes
   -o StrictHostKeyChecking=accept-new
   -o ConnectTimeout=8
   -p "$NHERE_PORT"
 )
 
-# Check mesh reachability.
-# Prefers tailscale ping (network-layer, no shell). Falls back to SSH probe.
-check_mesh() {
-  if command -v tailscale &>/dev/null; then
-    if tailscale ping -c 1 --timeout 5s "$NHERE_HOST" &>/dev/null; then
-      return 0
-    fi
-    echo "warn: tailscale ping failed — trying SSH probe" >&2
+# Resolve target: prefer Tailscale hostname, fall back to profile IP
+resolve_target() {
+  if tailscale ping -c 1 --timeout 4s "$NHERE_HOST" &>/dev/null 2>&1; then
+    echo "$NHERE_HOST"
+  elif [[ -n "${NHERE_HOST_IP:-}" ]]; then
+    echo "warn: MagicDNS not resolving — using Tailscale IP fallback" >&2
+    echo "$NHERE_HOST_IP"
+  else
+    echo "error: cannot resolve $NHERE_HOST and no IP fallback in profile" >&2
+    exit 1
   fi
-  ssh "${SSH_OPTS[@]}" "$NHERE_USER@$NHERE_HOST" true 2>/dev/null
 }
 
 case "$CMD" in
   ping)
-    if check_mesh; then
+    TARGET="$(resolve_target)"
+    if ssh "${SSH_OPTS[@]}" "$NHERE_USER@$TARGET" true 2>/dev/null; then
       echo "reachable   $NHERE_HOST :$NHERE_PORT"
     else
       echo "unreachable $NHERE_HOST" >&2
@@ -66,12 +58,9 @@ case "$CMD" in
     ;;
 
   status)
-    if ! check_mesh; then
-      echo "error: cannot reach $NHERE_HOST — check Tailscale and sshd on phone" >&2
-      exit 1
-    fi
+    TARGET="$(resolve_target)"
     echo "--- $PROFILE ---"
-    ssh "${SSH_OPTS[@]}" "$NHERE_USER@$NHERE_HOST" "sh $AGENT_PATH status"
+    ssh "${SSH_OPTS[@]}" "$NHERE_USER@$TARGET" "sh $AGENT_PATH status"
     ;;
 
   *)
