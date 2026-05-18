@@ -2,17 +2,20 @@
 
 ## Prerequisites
 
-**Mac side**
-- `tailscale` installed and running (`brew install tailscale` — start via menu bar)
-- `ssh` available (macOS ships it)
-- An ed25519 key pair for the phone (`~/.ssh/nhere_ed25519`)
-- Nothing 3a Pro enrolled in the same Tailscale network
+**Mac**
+- `tailscale` installed (`brew install tailscale`)
+- `deno` installed (`brew install deno`)
+- `adb` installed (`brew install android-platform-tools`)
+- `scrcpy` installed (`brew install scrcpy`)
+- `ffmpeg` installed (`brew install ffmpeg`)
+- ed25519 key pair for phone (`~/.ssh/nhere_ed25519`)
+- Phone enrolled in same Tailscale network
 
-**Phone side (Nothing 3a Pro)**
-- Termux installed (F-Droid build recommended)
+**Phone (Nothing 3a Pro)**
+- Termux (F-Droid build)
 - Termux packages: `openssh`, `termux-api`
-- Magisk for privilege layer (required for `root:` status field)
-- Tailscale installed and logged into the same network
+- Magisk + nhere v2.0 module installed
+- Tailscale installed and logged in
 
 ---
 
@@ -24,41 +27,47 @@ ssh-keygen -t ed25519 -f ~/.ssh/nhere_ed25519 -C nhere
 
 ---
 
-## 2. Copy the example profile
+## 2. Copy profile
 
 ```bash
 cp profiles/nothing-3a-pro.example.conf profiles/nothing-3a-pro.conf
 ```
 
-Edit `profiles/nothing-3a-pro.conf`:
+Fill in real values:
 
-| Field | Where to find the real value |
-|---|---|
-| `NHERE_HOST` | Tailscale app on phone → machine name |
-| `NHERE_HOST_IP` | Tailscale app on phone → IP address |
-| `NHERE_PORT` | Termux default `8022` — confirm with `sshd -p` |
-| `NHERE_USER` | In Termux: `whoami` |
-| `NHERE_KEY` | Path to your ed25519 private key |
+| Field          | Where to find                         |
+|----------------|---------------------------------------|
+| `NHERE_HOST`   | Tailscale app → machine name          |
+| `NHERE_HOST_IP`| Tailscale app → IP                    |
+| `NHERE_PORT`   | `8022` (Termux default)               |
+| `NHERE_USER`   | Termux: `whoami`                      |
+| `NHERE_KEY`    | `~/.ssh/nhere_ed25519`                |
 
-The real `.conf` is gitignored. It never leaves your machine.
+Real `.conf` is gitignored. Never leaves your machine.
 
 ---
 
-## 3. Start sshd on the phone
-
-In Termux:
+## 3. Install nhere Magisk module (once per device)
 
 ```bash
-sshd
+# On Mac — package the module
+cd ~/Desktop/nothinghere/phone-side/magisk-module
+zip -r ../../../nhere-v2.zip . -x "*.DS_Store"
+
+# Push to phone
+adb push ../../../nhere-v2.zip /sdcard/Download/
 ```
 
-Verify it is listening:
+On phone: Magisk → Modules → Install from storage → `nhere-v2.zip` → Reboot.
 
+After reboot, verify in Termux:
 ```bash
-ss -tlnp | grep 8022
+su -c 'nhere status'
 ```
 
-Copy your public key to the phone (once):
+---
+
+## 4. Push SSH key to phone (once)
 
 ```bash
 ssh-copy-id -i ~/.ssh/nhere_ed25519.pub -p 8022 USER@TAILSCALE_IP
@@ -66,64 +75,81 @@ ssh-copy-id -i ~/.ssh/nhere_ed25519.pub -p 8022 USER@TAILSCALE_IP
 
 ---
 
-## 4. Deploy the agent to the phone
-
-```bash
-scp -P 8022 -i ~/.ssh/nhere_ed25519 phone-side/agent USER@HOST:~/nhere/agent
-ssh -p 8022 -i ~/.ssh/nhere_ed25519 USER@HOST chmod +x ~/nhere/agent
-```
-
----
-
-## 5. Run ping
+## 5. Test connection
 
 ```bash
 ./mac-side/ctl ping
-```
+# → reachable   nothing-phone-3a-pro :8022
 
-Expected output:
-```
-reachable   nothing-phone-3a-pro :8022
-```
-
----
-
-## 6. Run status
-
-```bash
 ./mac-side/ctl status
-```
-
-Expected output:
-```
---- nothing-3a-pro ---
-host:       localhost
-time:       2026-05-18T...Z
-state:      armed
-battery:    87% Charging
-root:       available
-tailscale:  up  tun0  100.x.x.x
-wakelock:   unknown
-ssh:        reachable (you are here)
+# → state: armed / disarmed
 ```
 
 ---
 
-## Alternate profile
+## 6. Bring everything up
 
 ```bash
-NHERE_PROFILE=other-device ./mac-side/ctl ping
+~/Desktop/nothinghere/mac-side/up-n
+```
+
+Or manually:
+```bash
+# Arm phone
+ssh -i ~/.ssh/nhere_ed25519 -p 8022 USER@IP 'su -c "nhere arm"'
+
+# Start cockpit
+cd ~/Desktop/nothinghere
+source profiles/nothing-3a-pro.conf
+NHERE_HOST_IP="$NHERE_HOST_IP" deno run \
+  --allow-net --allow-run --allow-read --allow-env \
+  mac-side/cockpit &
+
+open http://localhost:7779
+```
+
+---
+
+## 7. Enable ADB TCP on demand
+
+```bash
+# On phone (via SSH or Termux):
+su -c 'nhere relay-prep'
+
+# On Mac:
+source profiles/nothing-3a-pro.conf
+adb connect "$NHERE_HOST_IP:5555"
+```
+
+Or to persist ADB TCP at boot, set in `/data/adb/nhere/env` on phone:
+```
+NHERE_ADB_TCP=1
 ```
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Check |
-|---|---|
-| `tailscale not found` | Install tailscale, start the daemon |
-| `key file not found` | Run step 1 (keygen) |
-| `profile not found` | Run step 2 (copy example) |
-| `cannot resolve hostname` | Check Tailscale MagicDNS, ensure both devices are on the mesh |
-| `ssh: connect to host ... port 8022` | Confirm `sshd` is running in Termux on the phone |
-| `state: degraded` | Check Tailscale on phone is up |
+| Symptom                          | Fix                                              |
+|----------------------------------|--------------------------------------------------|
+| `tailscale not found`            | Install + start tailscale                        |
+| `key file not found`             | Run step 1                                       |
+| `profile not found`              | Run step 2                                       |
+| `cannot resolve hostname`        | Check Tailscale MagicDNS, both devices on mesh   |
+| `ssh: connect ... port 8022`     | Confirm sshd running: `su -c 'nhere status'`     |
+| `state: DEAD`                    | Run `su -c 'nhere arm'` on phone                 |
+| `state: DEGRADED`                | Check Tailscale on phone, run `nhere restart`    |
+| ADB not connecting               | Run `nhere relay-prep` first                     |
+| Cockpit shows DEAD but phone OK  | SSH directly, check `nhere status`, arm manually |
+| service.sh ran twice at boot     | Lock file `/data/adb/nhere/service.lock` prevents this — verify present |
+
+---
+
+## Recovery (phone unreachable via SSH)
+
+1. Tailscale still up → SSH in, run `su -c 'nhere arm'`
+2. USB → `adb -s DEVICE shell su -c 'nhere arm'`
+3. Physical → open Termux on phone → `su -c 'nhere arm'`
+
+Never build the system so a single disarm permanently locks out the operator.
+`nhere disarm` keeps Tailscale up by design for this reason.
