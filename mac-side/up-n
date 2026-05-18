@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# up-n — bring the full nothinghere stack online from Mac
+# Tailscale (Mac) → ADB → cockpit → stream → open browser
+# Usage: up-n [--no-stream] [--no-browser]
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+source "$REPO_ROOT/profiles/nothing-3a-pro.conf" 2>/dev/null || { echo "profile missing"; exit 1; }
+
+COCKPIT_URL="http://localhost:7779"
+ADB_SERIAL="${NHERE_HOST_IP}:5555"
+NO_STREAM=0; NO_BROWSER=0
+for arg in "$@"; do case "$arg" in --no-stream) NO_STREAM=1;; --no-browser) NO_BROWSER=1;; esac; done
+
+G='\033[32m'; Y='\033[33m'; R='\033[31m'; P='\033[35m'; C='\033[0m'
+ok()   { printf "  %-12s ${G}✓${C} %s\n" "[$1]" "$2"; }
+warn() { printf "  %-12s ${Y}~${C} %s\n" "[$1]" "$2"; }
+fail() { printf "  %-12s ${R}✗${C} %s\n" "[$1]" "$2"; }
+
+printf "\n${P}  nothinghere up-n${C}\n\n"
+
+# 1 — Mac Tailscale
+printf "  %-12s " "[tailscale]"
+if tailscale status >/dev/null 2>&1; then
+  printf "${G}✓${C} already up\n"
+else
+  printf "starting... "
+  tailscale up 2>/dev/null || sudo tailscale up 2>/dev/null || true
+  sleep 3
+  tailscale status >/dev/null 2>&1 && printf "${G}✓${C} up\n" || { printf "${Y}~${C} slow\n"; sleep 4; }
+fi
+
+# 2 — Verify phone reachable over Tailscale
+printf "  %-12s " "[phone ping]"
+if ping -c 1 -W 2 "$NHERE_HOST_IP" >/dev/null 2>&1; then
+  ok "phone ping" "$NHERE_HOST_IP reachable"
+else
+  fail "phone ping" "$NHERE_HOST_IP unreachable — is phone on?"
+  printf "\n  ${R}Cannot continue — phone not on Tailscale.${C}\n\n"; exit 1
+fi
+
+# 3 — ADB connect
+printf "  %-12s " "[adb]"
+adb connect "$ADB_SERIAL" >/dev/null 2>&1 || true
+sleep 1
+if adb -s "$ADB_SERIAL" shell echo ok >/dev/null 2>&1; then
+  ok "adb" "$ADB_SERIAL connected"
+else
+  # ADB daemon may be down — kick it via SSH
+  warn "adb" "not responding — kicking via SSH"
+  ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
+      'su -c "setprop service.adb.tcp.port 5555; stop adbd; sleep 1; start adbd"' 2>/dev/null || true
+  sleep 3
+  adb connect "$ADB_SERIAL" >/dev/null 2>&1 || true
+  adb -s "$ADB_SERIAL" shell echo ok >/dev/null 2>&1 \
+    && ok "adb" "$ADB_SERIAL connected (after kick)" \
+    || fail "adb" "still down — continuing without ADB"
+fi
+
+# 4 — Phone health check via SSH
+printf "  %-12s " "[phone health]"
+HEALTH="$(ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+    -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
+    'echo ok' 2>/dev/null || echo fail)"
+if [ "$HEALTH" = "ok" ]; then
+  # Check stack status
+  SSHD_UP="$(ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
+      'su -c "ss -ltnp 2>/dev/null | grep -c :8022 || echo 0"' 2>/dev/null || echo 0)"
+  TS_UP="$(ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
+      'su -c "ip link show tun0 2>/dev/null | grep -c UP || echo 0"' 2>/dev/null || echo 0)"
+  BAT="$(ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
+      'dumpsys battery 2>/dev/null | grep level | tr -d " " | cut -d: -f2' 2>/dev/null || echo '?')"
+  TS_LABEL="$([ "$TS_UP" -gt 0 ] 2>/dev/null && echo "up" || echo "DOWN")"
+  SSHD_LABEL="$([ "$SSHD_UP" -gt 0 ] 2>/dev/null && echo ":8022" || echo "DOWN")"
+  ok "phone health" "ssh✓  ts=$TS_LABEL  sshd=$SSHD_LABEL  bat=${BAT}%"
+  # If either is down, try to bring up
+  if [ "${TS_UP:-0}" -eq 0 ] || [ "${SSHD_UP:-0}" -eq 0 ]; then
+    warn "phone health" "stack incomplete — attempting recovery"
+    ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
+        "su -c 'am start -n com.tailscale.ipn/.MainActivity >/dev/null 2>&1; sleep 2; ss -ltnp | grep :8022 || su u0_a296 -c \"PATH=/data/data/com.termux/files/usr/bin:/system/bin sshd\"'" 2>/dev/null || true
+    ok "phone health" "recovery attempted"
+  fi
+else
+  fail "phone health" "SSH unreachable"
+fi
+
+# 5 — Cockpit
+printf "  %-12s " "[cockpit]"
+if curl -sf --max-time 2 "$COCKPIT_URL/status.json" >/dev/null 2>&1; then
+  ok "cockpit" "already running :7779"
+else
+  cd "$REPO_ROOT"
+  NHERE_HOST_IP="$NHERE_HOST_IP" nohup deno run \
+    --allow-net --allow-run --allow-read --allow-env \
+    mac-side/cockpit >/tmp/cockpit.log 2>&1 &
+  disown 2>/dev/null || true
+  for _ in $(seq 1 12); do
+    sleep 1
+    curl -sf --max-time 1 "$COCKPIT_URL/status.json" >/dev/null 2>&1 && break
+  done
+  curl -sf --max-time 2 "$COCKPIT_URL/status.json" >/dev/null 2>&1 \
+    && ok "cockpit" "started :7779" \
+    || warn "cockpit" "slow to start — check /tmp/cockpit.log"
+fi
+
+# 6 — Stream
+if [ "$NO_STREAM" -eq 0 ]; then
+  printf "  %-12s " "[stream]"
+  if curl -sf --max-time 2 "$COCKPIT_URL/stream.json" 2>/dev/null | grep -q '"alive":true'; then
+    ok "stream" "already streaming"
+  else
+    curl -sf --max-time 8 "$COCKPIT_URL/stream-start" >/dev/null 2>&1 || true
+    sleep 2
+    curl -sf --max-time 2 "$COCKPIT_URL/stream.json" 2>/dev/null | grep -q '"alive":true' \
+      && ok "stream" "started" \
+      || warn "stream" "not alive yet — start from cockpit"
+  fi
+fi
+
+# 7 — Open browser
+[ "$NO_BROWSER" -eq 0 ] && open "$COCKPIT_URL" 2>/dev/null || true
+
+# Final status
+STATE="$(curl -sf --max-time 3 "$COCKPIT_URL/status.json" 2>/dev/null | grep -o '"state":"[^"]*"' | cut -d'"' -f4 || echo unknown)"
+printf "\n${P}  ready${C}  cockpit=:7779  phone=${STATE}\n\n"

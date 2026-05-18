@@ -6,6 +6,8 @@ NP3A_SRC="$MODDIR/system/bin/np3a"
 NP3A_DST=/data/local/tmp/np3a
 WAKE_SRC="$MODDIR/system/bin/np3a-wake"
 WAKE_DST=/data/local/tmp/np3a-wake
+TOGGLE_SRC="$MODDIR/system/bin/np3a-toggle"
+TOGGLE_DST=/data/local/tmp/np3a-toggle
 
 {
   if [ -f "$LOCK" ]; then
@@ -16,6 +18,7 @@ WAKE_DST=/data/local/tmp/np3a-wake
 
   echo "np3a service start $(date)"
 
+  # Persist ADB TCP on :5555
   setprop service.adb.tcp.port 5555
   setprop persist.adb.tcp.port 5555
   stop adbd 2>/dev/null; sleep 1; start adbd 2>/dev/null
@@ -23,7 +26,8 @@ WAKE_DST=/data/local/tmp/np3a-wake
 
   sleep 40
 
-  for src_dst in "$NP3A_SRC:$NP3A_DST" "$WAKE_SRC:$WAKE_DST"; do
+  # refresh scripts from module
+  for src_dst in "$NP3A_SRC:$NP3A_DST" "$WAKE_SRC:$WAKE_DST" "$TOGGLE_SRC:$TOGGLE_DST"; do
     src="${src_dst%%:*}"
     dst="${src_dst##*:}"
     if [ -f "$src" ]; then
@@ -32,6 +36,7 @@ WAKE_DST=/data/local/tmp/np3a-wake
     fi
   done
 
+  # get termux uid with retries
   TERMUX_UID=""
   for i in 1 2 3 4 5; do
     TERMUX_UID="$(pm list packages -U com.termux 2>/dev/null | grep 'package:com.termux ' | sed -n 's/.*uid://p' | head -1)"
@@ -73,12 +78,14 @@ WAKE_DST=/data/local/tmp/np3a-wake
   ss -ltnp 2>/dev/null | grep ':8022' && echo "sshd listening :8022" \
     || echo "sshd not listening"
 
+  # np3a-wake daemon
   if [ -x "$WAKE_DST" ]; then
     pkill -f "np3a-wake" 2>/dev/null || true
     setsid "$WAKE_DST" >>/data/local/tmp/np3a-wake.log 2>&1 &
     echo "np3a-wake started (PID $!)"
   fi
 
+  # np3a-button daemon (vol-down x3 → unlock)
   BUTTON_DST=/data/local/tmp/np3a-button
   if [ -f "$MODDIR/system/bin/np3a-button" ]; then
     cp "$MODDIR/system/bin/np3a-button" "$BUTTON_DST"
@@ -88,6 +95,13 @@ WAKE_DST=/data/local/tmp/np3a-wake
     pkill -f "np3a-button" 2>/dev/null || true
     setsid "$BUTTON_DST" >>/data/local/tmp/np3a-button.log 2>&1 &
     echo "np3a-button started (PID $!)"
+  fi
+
+  # np3a-toggle daemon (double power press → toggle connection stack)
+  if [ -x "$TOGGLE_DST" ]; then
+    pkill -f "np3a-toggle" 2>/dev/null || true
+    setsid "$TOGGLE_DST" >>/data/local/tmp/np3a-toggle.log 2>&1 &
+    echo "np3a-toggle started (PID $!)"
   fi
 
 } >>"$LOG" 2>&1
