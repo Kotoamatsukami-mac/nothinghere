@@ -77,14 +77,21 @@ function stopStream(): void {
 }
 
 function buildHtml(fields: Record<string, string>, streamOn: boolean, relayAlive: boolean, recAlive: boolean): string {
-  const state = fields["state"] ?? "unknown";
+  const rawState = fields["state"] ?? "unknown";
   const battery = fields["battery"] ?? "—";
   const root = fields["root"] ?? "—";
   const ts = fields["tailscale"] ?? "—";
   const sshd = fields["sshd"] ?? "—";
   const wakelock = fields["wakelock"] ?? "—";
   const time = fields["time"] ?? "—";
-  const sc = state==="armed"?"#c084fc":state==="unreachable"?"#f87171":state==="degraded"?"#fbbf24":"#a78bfa";
+
+  // Normalise raw state → LIVE / DEGRADED / DEAD
+  const isLive     = rawState === "armed";
+  const isDegraded = rawState === "degraded";
+  const state      = isLive ? "LIVE" : isDegraded ? "DEGRADED" : "DEAD";
+  const sc         = isLive ? "#facc15" : isDegraded ? "#fb923c" : "#4a4068";
+  const bodyClass  = isLive ? "state-live" : isDegraded ? "state-degraded" : "state-dead";
+
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>nothinghere</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
 <style>
@@ -92,11 +99,31 @@ function buildHtml(fields: Record<string, string>, streamOn: boolean, relayAlive
 :root{--bg:#08060f;--panel:#100d1e;--border:#1e1830;--purple:#7c3aed;--ps:#a78bfa;--pink:#e879f9;--pb:#f0abfc;--white:#f5f0ff;--wd:#c4b8e8;--muted:#4a4068;--r:10px;--f:'SF Mono','JetBrains Mono',monospace}
 html,body{height:100%;background:var(--bg);color:var(--white);font-family:var(--f);font-size:13px}
 body{display:flex;flex-direction:column;min-height:100vh}
-body::before{content:'';display:block;height:2px;background:linear-gradient(90deg,var(--purple),var(--pink),var(--purple));position:fixed;top:0;left:0;right:0;z-index:100}
-header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--border);flex-shrink:0}
+
+/* ── state-driven lightning bar (GPU-only, no JS) ── */
+body::before{content:'';display:block;height:3px;position:fixed;top:0;left:0;right:0;z-index:100;transition:opacity .6s}
+.state-live::before{background:linear-gradient(90deg,transparent 0%,#facc15 20%,#fef08a 50%,#facc15 80%,transparent 100%);background-size:200% 100%;animation:bolt-slide 1.4s linear infinite;opacity:1;box-shadow:0 0 8px 2px #facc1566}
+.state-degraded::before{background:linear-gradient(90deg,transparent,#fb923c,transparent);background-size:200% 100%;animation:bolt-slide 2.8s linear infinite;opacity:.6}
+.state-dead::before{background:#1e1830;animation:none;opacity:.35;box-shadow:none}
+@keyframes bolt-slide{0%{background-position:200% 0}100%{background-position:-200% 0}}
+
+/* ── jagged SVG bolt overlay (pure CSS, no engine) ── */
+.lw{position:fixed;inset:0;pointer-events:none;z-index:1;overflow:hidden}
+.state-dead .lw{opacity:0}
+.state-degraded .lw{opacity:.12}
+.state-live .lw{opacity:1}
+.lw svg{position:absolute;width:100%;height:100%}
+.bolt{stroke-dasharray:500;stroke-dashoffset:500;animation:draw-bolt 1.8s ease-in-out infinite}
+.bolt:nth-child(2){animation-delay:.6s;animation-duration:2.3s}
+.bolt:nth-child(3){animation-delay:1.2s;animation-duration:1.6s}
+@keyframes draw-bolt{0%{stroke-dashoffset:500;opacity:0}12%{opacity:.9}65%{stroke-dashoffset:0;opacity:.7}80%{opacity:0}100%{stroke-dashoffset:500;opacity:0}}
+
+header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--border);flex-shrink:0;position:relative;z-index:10}
+.state-live header{box-shadow:0 1px 0 0 #facc1528,0 2px 16px 0 #facc1514}
 header h1{font-size:15px;font-weight:600;letter-spacing:.04em;color:var(--ps)}
 header h1 span{color:var(--pink);margin-right:6px}
-.badge{font-size:11px;padding:3px 10px;border-radius:20px;background:color-mix(in srgb,${sc} 15%,transparent);color:${sc};border:1px solid color-mix(in srgb,${sc} 40%,transparent);font-weight:600;letter-spacing:.05em}
+.badge{font-size:11px;padding:3px 10px;border-radius:20px;background:color-mix(in srgb,${sc} 15%,transparent);color:${sc};border:1px solid color-mix(in srgb,${sc} 40%,transparent);font-weight:700;letter-spacing:.08em;transition:all .5s}
+.state-live .badge{box-shadow:0 0 10px 1px #facc1555}
 .hr{display:flex;align-items:center;gap:10px}
 .ts{font-size:11px;color:var(--muted)}
 main{display:grid;grid-template-columns:272px 1fr;gap:0;flex:1;overflow:hidden}
@@ -129,7 +156,8 @@ video{max-width:100%;max-height:100%;display:block;object-fit:contain}
 .fsb{position:absolute;bottom:12px;right:12px;background:color-mix(in srgb,var(--purple) 30%,transparent);border:1px solid var(--ps);color:var(--ps);border-radius:7px;padding:5px 10px;font-size:10px;font-family:var(--f);cursor:pointer;transition:all .15s;z-index:10;letter-spacing:.05em}
 .fsb:hover{background:color-mix(in srgb,var(--purple) 50%,transparent);color:var(--white)}
 ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
-</style></head><body>
+</style></head><body class="${bodyClass}">
+<div class="lw" aria-hidden="true"><svg viewBox="0 0 1440 900" fill="none" xmlns="http://www.w3.org/2000/svg"><polyline class="bolt" points="200,0 260,180 230,180 310,400 270,400 380,700 340,700 420,900" stroke="#facc15" stroke-width="1.5" stroke-linejoin="round"/><polyline class="bolt" points="900,0 950,220 920,220 1010,480 970,480 1060,900" stroke="#fde047" stroke-width="1" stroke-linejoin="round"/><polyline class="bolt" points="1300,100 1340,300 1310,300 1380,600 1350,600 1400,900" stroke="#facc15" stroke-width="1.2" stroke-linejoin="round"/></svg></div>
 <header><h1><span>◈</span>nothinghere</h1><div class="hr"><span class="ts">${time.slice(11,19)} UTC</span><span class="badge">${state}</span></div></header>
 <main>
 <div class="left">

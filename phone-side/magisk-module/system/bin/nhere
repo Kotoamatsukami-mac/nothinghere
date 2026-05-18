@@ -1,0 +1,181 @@
+#!/system/bin/sh
+# nhere — command engine v2.0
+# No loops. No listeners. Called on demand only.
+# Lives at /system/bin/nhere (Magisk overlay) + /data/adb/nhere/nhere (boot copy)
+
+NHERE_DIR=/data/adb/nhere
+STATE_FILE="$NHERE_DIR/state"
+LOG="$NHERE_DIR/nhere.log"
+TERMUX_BIN=/data/data/com.termux/files/usr/bin
+SSHD_BIN="$TERMUX_BIN/sshd"
+SSHD_PORT=8022
+
+# ── util ─────────────────────────────────────────────────────────────────────
+
+ts()          { date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; }
+log()         { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null; }
+die()         { echo "error: $*" >&2; exit 1; }
+read_state()  { [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || echo "unknown"; }
+write_state() { mkdir -p "$NHERE_DIR"; printf '%s\n' "$1" > "$STATE_FILE"; log "state -> $1"; }
+
+termux_uid() {
+    uid="$(pm list packages -U com.termux 2>/dev/null \
+        | grep 'package:com.termux ' \
+        | sed -n 's/.*uid://p' | head -1 | tr -d '[:space:]')"
+    [ -z "$uid" ] && die "Termux UID not found"
+    echo "$uid"
+}
+
+termux_user() {
+    uid="$(termux_uid)"
+    echo "u0_a$((uid - 10000))"
+}
+
+run_termux() {
+    su "$(termux_user)" -c "PATH=$TERMUX_BIN:/system/bin $*"
+}
+
+# ── probes ───────────────────────────────────────────────────────────────────
+
+probe_sshd() {
+    pgrep -f "$SSHD_BIN" >/dev/null 2>&1 && echo "up :$SSHD_PORT" || echo "down"
+}
+
+probe_tailscale() {
+    ip="$(ifconfig 2>/dev/null | awk '/^tun0/{f=1} f && /inet /{print $2; exit}')"
+    [ -n "$ip" ] && echo "up tun0 $ip" || echo "down"
+}
+
+probe_wakelock() {
+    wl="$(su -c "dumpsys power 2>/dev/null | grep -c 'PARTIAL_WAKE_LOCK'" 2>/dev/null || echo 0)"
+    [ "${wl:-0}" -gt 0 ] && echo "held" || echo "released"
+}
+
+probe_battery() {
+    raw="$(su -c "dumpsys battery 2>/dev/null" 2>/dev/null)"
+    pct="$(printf '%s' "$raw" | grep 'level:' | tr -dc '0-9')"
+    sta="$(printf '%s' "$raw" | grep 'status:' | tr -dc '0-9')"
+    # status 2=charging 3=discharging 5=full
+    case "$sta" in
+        2) label="charging" ;; 5) label="full" ;; *) label="discharging" ;;
+    esac
+    [ -n "$pct" ] && echo "${pct}% $label" || echo "unknown"
+}
+
+probe_thermal() {
+    # Best-effort; not all ROMs expose this path
+    zone=/sys/class/thermal/thermal_zone0/temp
+    if [ -f "$zone" ]; then
+        raw="$(cat $zone 2>/dev/null)"
+        echo "$((raw / 1000))°C"
+    else
+        echo "unavailable"
+    fi
+}
+
+probe_adb() {
+    port="$(getprop service.adb.tcp.port 2>/dev/null)"
+    [ "$port" = "5555" ] && echo "tcp :5555" || echo "usb-only"
+}
+
+probe_root() {
+    id="$(su -c id 2>/dev/null | grep -o 'uid=[0-9]*' | head -1)"
+    [ "$id" = "uid=0" ] && echo "ok" || echo "unavailable"
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    state="$(read_state)"
+    printf 'state:      %s\n' "$state"
+    printf 'root:       %s\n' "$(probe_root)"
+    printf 'battery:    %s\n' "$(probe_battery)"
+    printf 'thermal:    %s\n' "$(probe_thermal)"
+    printf 'sshd:       %s\n' "$(probe_sshd)"
+    printf 'tailscale:  %s\n' "$(probe_tailscale)"
+    printf 'wakelock:   %s\n' "$(probe_wakelock)"
+    printf 'adb:        %s\n' "$(probe_adb)"
+}
+
+cmd_arm() {
+    log "arm: begin"
+
+    # sshd
+    if ! pgrep -f "$SSHD_BIN" >/dev/null 2>&1; then
+        run_termux sshd && log "arm: sshd started" || log "arm: sshd start failed"
+    else
+        log "arm: sshd already running"
+    fi
+
+    # wakelock — optional, best-effort via Termux API
+    run_termux "termux-wake-lock 2>/dev/null" && log "arm: wakelock acquired" \
+        || log "arm: wakelock unavailable (termux-api missing?)"
+
+    # Tailscale — report only, never force
+    ts_state="$(probe_tailscale)"
+    log "arm: tailscale=$ts_state"
+
+    write_state "armed"
+    printf 'armed\nsshd: %s\ntailscale: %s\n' "$(probe_sshd)" "$ts_state"
+}
+
+cmd_disarm() {
+    log "disarm: begin"
+
+    # release wakelock first
+    run_termux "termux-wake-unlock 2>/dev/null" && log "disarm: wakelock released" \
+        || log "disarm: wakelock release skipped"
+
+    write_state "disarmed"
+
+    # delay sshd stop 2s — keeps SSH session alive long enough to ack
+    ( sleep 2; pkill -f "$SSHD_BIN" 2>/dev/null; log "disarm: sshd stopped" ) &
+
+    # Tailscale: left up. Never forced down.
+    log "disarm: tailscale left up"
+
+    printf 'disarmed\ntailscale: %s (left up)\n' "$(probe_tailscale)"
+}
+
+cmd_toggle() {
+    state="$(read_state)"
+    case "$state" in
+        armed)    cmd_disarm ;;
+        *)        cmd_arm    ;;
+    esac
+}
+
+cmd_restart() {
+    log "restart: begin"
+    cmd_disarm
+    sleep 3
+    cmd_arm
+}
+
+cmd_relay_prep() {
+    log "relay-prep: begin"
+    # Enable ADB TCP — only on explicit request
+    setprop service.adb.tcp.port 5555
+    stop adbd 2>/dev/null; sleep 1; start adbd 2>/dev/null
+    sleep 2
+    ts_ip="$(probe_tailscale | grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}')"
+    log "relay-prep: done ts_ip=$ts_ip"
+    printf 'relay-prep done\nadb: tcp :5555\ntailscale: %s\nconnect: adb connect %s:5555\n' \
+        "$(probe_tailscale)" "${ts_ip:-unknown}"
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+
+CMD="${1:-status}"
+case "$CMD" in
+    status)      cmd_status      ;;
+    arm)         cmd_arm         ;;
+    disarm)      cmd_disarm      ;;
+    toggle)      cmd_toggle      ;;
+    restart)     cmd_restart     ;;
+    relay-prep)  cmd_relay_prep  ;;
+    *)
+        printf 'nhere v2.0\nusage: nhere <status|arm|disarm|toggle|restart|relay-prep>\n' >&2
+        exit 1
+        ;;
+esac
