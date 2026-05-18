@@ -1,54 +1,95 @@
 #!/usr/bin/env -S deno run --allow-net --allow-run --allow-read --allow-env
-// mac-side/cockpit — tiny localhost status cockpit
-// Usage: deno run --allow-net --allow-run --allow-read --allow-env mac-side/cockpit
-// Or:    chmod +x mac-side/cockpit && ./mac-side/cockpit
-// Opens at http://localhost:7779
+// mac-side/cockpit — nothinghere control cockpit
+// Usage: ./mac-side/cockpit  (from repo root)
+// http://localhost:7779
 
-const PORT = 7779;
+const PORT      = 7779;
 const SCRIPT_DIR = new URL(".", import.meta.url).pathname;
-const CTL = `${SCRIPT_DIR}ctl`;
+const REPO_ROOT  = SCRIPT_DIR.replace(/\/?mac-side\/?$/, "");
+const CTL        = `${SCRIPT_DIR}ctl`;
+const ADB        = "/usr/local/bin/adb";
+const SCRCPY     = "/usr/local/bin/scrcpy";
+const REC_DIR    = `${REPO_ROOT}recordings`;
+const ADB_TARGET = Deno.env.get("NHERE_HOST_IP") || "100.123.75.12";
+const ADB_SERIAL = `${ADB_TARGET}:5555`;
+
+// ── In-memory relay state ──────────────────────────────────────────────────
+let relayPid:      number | null = null;
+let recordingPid:  number | null = null;
+let recordingPath: string | null = null;
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+async function sh(cmd: string): Promise<string> {
+  const p = new Deno.Command("sh", { args: ["-c", cmd], stdout: "piped", stderr: "piped" });
+  const { stdout, stderr } = await p.output();
+  return (new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr)).trim();
+}
+
+async function adb(...args: string[]): Promise<string> {
+  return sh(`${ADB} -s ${ADB_SERIAL} ${args.join(" ")} 2>/dev/null`);
+}
 
 async function runCtl(cmd: string): Promise<string> {
   try {
-    const proc = new Deno.Command("bash", {
-      args: [CTL, cmd],
-      stdout: "piped",
-      stderr: "piped",
-      cwd: SCRIPT_DIR,
+    const p = new Deno.Command("bash", {
+      args: [CTL, cmd], stdout: "piped", stderr: "piped", cwd: REPO_ROOT,
     });
-    const { stdout, stderr } = await proc.output();
-    const out = new TextDecoder().decode(stdout).trim();
-    const err = new TextDecoder().decode(stderr).trim();
-    return out || err || "(no output)";
-  } catch (e) {
-    return `error: ${e}`;
-  }
+    const { stdout, stderr } = await p.output();
+    const o = new TextDecoder().decode(stdout).trim();
+    const e = new TextDecoder().decode(stderr).trim();
+    return o || e || "(no output)";
+  } catch (e) { return `error: ${e}`; }
 }
 
 function parseStatus(raw: string): Record<string, string> {
-  const fields: Record<string, string> = {};
-  for (const line of raw.split("\n")) {
-    const m = line.match(/^(\w+):\s+(.*)/);
-    if (m) fields[m[1]] = m[2].trim();
+  const f: Record<string, string> = {};
+  for (const l of raw.split("\n")) {
+    const m = l.match(/^(\w+):\s+(.*)/);
+    if (m) f[m[1]] = m[2].trim();
   }
-  return fields;
+  return f;
 }
 
-function stateColor(state: string): string {
-  if (state.startsWith("armed"))    return "#9d6dff";
-  if (state.startsWith("degraded")) return "#d97880";
-  if (state.startsWith("rescue"))   return "#f08898";
+function stateColor(s: string): string {
+  if (s.startsWith("armed"))    return "#9d6dff";
+  if (s.startsWith("degraded")) return "#d97880";
   return "#4a3a6a";
 }
 
-function html(fields: Record<string, string>, raw: string, ts: string): string {
-  const state = fields["state"] ?? "unknown";
+function isPidAlive(pid: number): boolean {
+  try {
+    Deno.kill(pid, "SIGCONT");
+    return true;
+  } catch { return false; }
+}
+
+function relayAlive(): boolean {
+  return relayPid !== null && isPidAlive(relayPid);
+}
+function recordingAlive(): boolean {
+  return recordingPid !== null && isPidAlive(recordingPid);
+}
+
+async function ensureAdb(): Promise<boolean> {
+  const devices = await sh(`${ADB} devices`);
+  if (devices.includes(ADB_SERIAL) && devices.includes("device")) return true;
+  await sh(`${ADB} connect ${ADB_SERIAL}`);
+  await new Promise(r => setTimeout(r, 1200));
+  const check = await sh(`${ADB} devices`);
+  return check.includes(ADB_SERIAL) && check.includes("device");
+}
+
+// ── HTML ───────────────────────────────────────────────────────────────────
+function html(fields: Record<string, string>, ts: string): string {
+  const state     = fields["state"] ?? "unknown";
+  const sc        = stateColor(state);
+  const relayOn   = relayAlive();
+  const recOn     = recordingAlive();
+
   const rows = Object.entries(fields).map(([k, v]) => `
     <tr>
-      <td class="key">${k}</td>
-      <td class="val" style="${k==="state"?`color:${stateColor(v)};font-weight:bold`:""}">
-        ${v}
-      </td>
+      <td class="k">${k}</td>
+      <td class="v" style="${k==="state"?`color:${sc};font-weight:600`:""}">${v}</td>
     </tr>`).join("");
 
   return `<!DOCTYPE html>
@@ -56,74 +97,215 @@ function html(fields: Record<string, string>, raw: string, ts: string): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="10">
 <title>nothinghere</title>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#080610;color:#cac0f0;font:13px/1.5 "JetBrains Mono",monospace;padding:28px 32px}
-  h1{font-size:14px;color:#9d6dff;letter-spacing:.08em;margin-bottom:20px}
-  .state-badge{display:inline-block;padding:3px 10px;border-radius:3px;
-    background:${stateColor(state)}22;color:${stateColor(state)};
-    font-size:12px;border:1px solid ${stateColor(state)}55;margin-bottom:20px}
-  table{border-collapse:collapse;width:100%;max-width:520px}
-  td{padding:5px 0;vertical-align:top}
-  .key{color:#4a3a6a;width:110px;padding-right:16px}
-  .val{color:#cac0f0}
-  .raw{margin-top:24px;color:#3d2d60;font-size:11px;white-space:pre}
-  .ts{margin-top:20px;color:#3d2d60;font-size:11px}
-  .actions{margin-bottom:24px;display:flex;gap:10px}
-  button{background:#141020;border:1px solid #3d2d60;color:#9d6dff;
-    padding:6px 14px;border-radius:3px;cursor:pointer;font:12px monospace;
-    transition:border-color .15s}
-  button:hover{border-color:#9d6dff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#080610;color:#cac0f0;font:13px/1.6 "JetBrains Mono",monospace;padding:32px 36px;max-width:680px}
+h1{font-size:13px;color:#9d6dff;letter-spacing:.1em;text-transform:uppercase;margin-bottom:6px}
+.sub{font-size:11px;color:#3d2d60;margin-bottom:24px}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:3px 12px;border-radius:3px;
+  background:${sc}18;color:${sc};font-size:11px;border:1px solid ${sc}44;margin-bottom:24px}
+.dot{width:6px;height:6px;border-radius:50%;background:${sc};
+  ${state.startsWith("armed")?"animation:pulse 2s ease-in-out infinite":""}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* status table */
+table{border-collapse:collapse;width:100%;margin-bottom:28px}
+td{padding:4px 0;vertical-align:top}
+.k{color:#4a3a6a;width:110px;padding-right:16px;font-size:12px}
+.v{color:#cac0f0;font-size:12px}
+
+/* sections */
+.section{margin-bottom:28px}
+.section-label{font-size:10px;color:#3d2d60;letter-spacing:.12em;text-transform:uppercase;
+  margin-bottom:10px;border-bottom:1px solid #141020;padding-bottom:6px}
+
+/* relay indicator */
+.relay-row{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+.relay-badge{font-size:11px;padding:2px 8px;border-radius:2px;
+  background:${relayOn?"#9d6dff22":"#1a1530"};
+  color:${relayOn?"#9d6dff":"#4a3a6a"};
+  border:1px solid ${relayOn?"#9d6dff44":"#1c1530"}}
+.rec-badge{font-size:11px;padding:2px 8px;border-radius:2px;
+  background:${recOn?"#d9788022":"#1a1530"};
+  color:${recOn?"#d97880":"#4a3a6a"};
+  border:1px solid ${recOn?"#d9788044":"#1c1530"};
+  ${recOn?"animation:pulse 1.4s ease-in-out infinite":""}}
+
+/* buttons */
+.btns{display:flex;flex-wrap:wrap;gap:8px}
+button{background:#0e0c1c;border:1px solid #2a1f48;color:#9d6dff;
+  padding:7px 16px;border-radius:3px;cursor:pointer;font:12px "JetBrains Mono",monospace;
+  transition:all .15s;letter-spacing:.03em}
+button:hover{background:#141020;border-color:#9d6dff;color:#c0a8ff}
+button.danger{color:#d97880;border-color:#2a1520}
+button.danger:hover{background:#1a0d10;border-color:#d97880}
+button.active{background:#9d6dff22;border-color:#9d6dff88;color:#c0a8ff}
+button:disabled{opacity:.3;cursor:not-allowed;pointer-events:none}
+
+.shortcuts{font-size:10px;color:#2a1f48;margin-top:28px;line-height:2}
+.shortcuts kbd{background:#0e0c1c;border:1px solid #2a1f48;border-radius:2px;
+  padding:1px 5px;font-family:inherit;color:#4a3a6a}
+.ts{margin-top:24px;color:#2a1f48;font-size:10px}
 </style>
 </head>
 <body>
+
 <h1>nothinghere</h1>
-<div class="state-badge">${state}</div>
-<div class="actions">
-  <button onclick="location.reload()">refresh</button>
-  <button onclick="fetch('/ping').then(r=>r.text()).then(t=>alert(t))">ping</button>
-  <button onclick="fetch('/open-screen').then(r=>r.text()).then(t=>console.log(t))">open screen</button>
+<p class="sub">Nothing A059P · Android 16 · Tailscale ${ADB_TARGET}</p>
+
+<div class="badge"><span class="dot"></span>${state}</div>
+
+<div class="section">
+  <div class="section-label">device</div>
+  <table>${rows}</table>
 </div>
-<table>${rows}</table>
-<div class="ts">last polled ${ts} · auto-refresh 10s</div>
+
+<div class="section">
+  <div class="section-label">screen relay</div>
+  <div class="relay-row">
+    <span class="relay-badge">${relayOn ? "● relay active" : "○ relay off"}</span>
+    <span class="rec-badge">${recOn ? "⏺ recording" : "○ not recording"}</span>
+  </div>
+  <div class="btns">
+    <button onclick="act('open-screen')"  id="btn-open"   ${relayOn?"class='active'":""}>
+      ${relayOn ? "screen open" : "open screen"}
+    </button>
+    <button onclick="act('close-screen')" class="danger"  ${!relayOn?"disabled":""}>close screen</button>
+    <button onclick="act('record')"       id="btn-rec"    ${recOn?"class='active'":""}>
+      ${recOn ? "⏺ recording…" : "record screen"}
+    </button>
+    <button onclick="act('stop-record')"  class="danger"  ${!recOn?"disabled":""}>stop recording</button>
+    <button onclick="act('screenshot')">screenshot</button>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-label">controller</div>
+  <div class="btns">
+    <button onclick="act('ping')">ping</button>
+    <button onclick="location.reload()">refresh</button>
+  </div>
+</div>
+
+<div class="shortcuts">
+  <kbd>S</kbd> open screen &nbsp;
+  <kbd>R</kbd> record &nbsp;
+  <kbd>P</kbd> ping &nbsp;
+  <kbd>X</kbd> close screen &nbsp;
+  <kbd>Space</kbd> refresh
+</div>
+
+<p class="ts">last polled ${ts} · <a href="/status.json" style="color:#3d2d60">json</a></p>
+
+<script>
+async function act(cmd) {
+  const r = await fetch('/' + cmd);
+  const t = await r.text();
+  if (cmd === 'ping') { alert(t); return; }
+  if (cmd === 'screenshot') { alert('saved: ' + t); return; }
+  setTimeout(() => location.reload(), 600);
+}
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === 's') act('open-screen');
+  if (k === 'r') act('record');
+  if (k === 'p') act('ping');
+  if (k === 'x') act('close-screen');
+  if (k === ' ') location.reload();
+});
+</script>
 </body>
 </html>`;
 }
 
-const server = Deno.serve({ port: PORT, hostname: "127.0.0.1" }, async (req) => {
-  const url = new URL(req.url);
+// ── Routes ─────────────────────────────────────────────────────────────────
+Deno.serve({ port: PORT, hostname: "127.0.0.1" }, async (req) => {
+  const path = new URL(req.url).pathname;
+  const txt  = (s: string) => new Response(s, { headers: { "content-type": "text/plain" }});
 
-  if (url.pathname === "/ping") {
-    const out = await runCtl("ping");
-    return new Response(out, { headers: { "content-type": "text/plain" } });
+  if (path === "/ping") {
+    return txt(await runCtl("ping"));
   }
 
-  if (url.pathname === "/open-screen") {
-    const adbHost = Deno.env.get("NHERE_HOST_IP") || "100.123.75.12";
-    new Deno.Command("sh", {
-      args: ["-c", `nohup scrcpy --tcpip=${adbHost}:5555 --window-title="nothing 3a pro" --stay-awake > /tmp/scrcpy.log 2>&1 &`],
-    }).spawn();
-    return new Response("scrcpy launched", { headers: { "content-type": "text/plain" } });
+  if (path === "/open-screen") {
+    if (relayAlive()) return txt("already open");
+    const ok = await ensureAdb();
+    if (!ok) return txt("error: adb device not reachable");
+    const proc = new Deno.Command(SCRCPY, {
+      args: [
+        `--tcpip=${ADB_TARGET}:5555`,
+        "--window-title=nothing 3a pro",
+        "--stay-awake",
+        "--window-borderless",
+        "--max-size=1080",
+      ],
+      stdout: "null", stderr: "null",
+    });
+    const child = proc.spawn();
+    relayPid = child.pid;
+    return txt(`relay open pid=${relayPid}`);
   }
 
-  if (url.pathname === "/status.json") {
+  if (path === "/close-screen") {
+    if (relayPid) { try { Deno.kill(relayPid, "SIGTERM"); } catch { /**/ } relayPid = null; }
+    return txt("relay closed");
+  }
+
+  if (path === "/record") {
+    if (recordingAlive()) return txt("already recording");
+    const ok = await ensureAdb();
+    if (!ok) return txt("error: adb not reachable");
+    try { await Deno.mkdir(REC_DIR, { recursive: true }); } catch { /**/ }
+    const ts  = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    recordingPath = `${REC_DIR}/rec-${ts}.mp4`;
+    const proc = new Deno.Command(SCRCPY, {
+      args: [
+        `--tcpip=${ADB_TARGET}:5555`,
+        `--record=${recordingPath}`,
+        "--no-display",
+        "--stay-awake",
+      ],
+      stdout: "null", stderr: "null",
+    });
+    const child = proc.spawn();
+    recordingPid = child.pid;
+    return txt(`recording → ${recordingPath}`);
+  }
+
+  if (path === "/stop-record") {
+    if (recordingPid) { try { Deno.kill(recordingPid, "SIGTERM"); } catch { /**/ } recordingPid = null; }
+    const p = recordingPath ?? "none";
+    recordingPath = null;
+    return txt(`stopped → ${p}`);
+  }
+
+  if (path === "/screenshot") {
+    const ok = await ensureAdb();
+    if (!ok) return txt("error: adb not reachable");
+    try { await Deno.mkdir(REC_DIR, { recursive: true }); } catch { /**/ }
+    const ts   = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const dest = `${REC_DIR}/shot-${ts}.png`;
+    await sh(`${ADB} -s ${ADB_SERIAL} exec-out screencap -p > "${dest}"`);
+    return txt(dest);
+  }
+
+  if (path === "/status.json") {
     const raw = await runCtl("status");
     return new Response(JSON.stringify({ raw, fields: parseStatus(raw) }), {
       headers: { "content-type": "application/json" },
     });
   }
 
-  // Default: status page
-  const raw = await runCtl("status");
+  // Default: main page
+  const raw    = await runCtl("status");
   const fields = parseStatus(raw);
-  const ts = new Date().toISOString();
-  return new Response(html(fields, raw, ts), {
+  const ts     = new Date().toISOString();
+  return new Response(html(fields, ts), {
     headers: { "content-type": "text/html; charset=utf-8" },
   });
 });
 
 console.log(`cockpit → http://localhost:${PORT}`);
-// Open in default browser
 new Deno.Command("open", { args: [`http://localhost:${PORT}`] }).spawn();
