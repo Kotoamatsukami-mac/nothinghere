@@ -2,18 +2,30 @@
 # mac-side/ctl — Slice 1 controller
 #
 # Usage:
-#   ctl [ping|status]
-#   NHERE_PROFILE=<name> ctl [ping|status]
+#   ./mac-side/ctl [ping|status]
+#   NHERE_PROFILE=<name> ./mac-side/ctl [ping|status]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
+# --- Hard dependency preflight (before profile load) -------------------------
+command -v tailscale &>/dev/null \
+  || { echo "error: tailscale not found — install: brew install tailscale" >&2; exit 1; }
+
+command -v ssh &>/dev/null \
+  || { echo "error: ssh not found" >&2; exit 1; }
+
+# --- Profile -----------------------------------------------------------------
 PROFILE="${NHERE_PROFILE:-nothing-3a-pro}"
 PROFILE_FILE="$REPO_ROOT/profiles/$PROFILE.conf"
 
-[[ -f "$PROFILE_FILE" ]] || { echo "error: profile not found: $PROFILE_FILE" >&2; exit 1; }
+[[ -f "$PROFILE_FILE" ]] \
+  || { echo "error: profile not found: $PROFILE_FILE" >&2
+       echo "  copy profiles/$PROFILE.example.conf → profiles/$PROFILE.conf and fill real values" >&2
+       exit 1; }
+
 # shellcheck source=/dev/null
 source "$PROFILE_FILE"
 
@@ -22,6 +34,13 @@ source "$PROFILE_FILE"
 : "${NHERE_USER:?profile must define NHERE_USER}"
 : "${NHERE_KEY:?profile must define NHERE_KEY}"
 
+# --- Key file preflight (after profile load) ---------------------------------
+[[ -f "$NHERE_KEY" ]] \
+  || { echo "error: key file not found: $NHERE_KEY" >&2
+       echo "  generate: ssh-keygen -t ed25519 -f $NHERE_KEY -C nhere" >&2
+       exit 1; }
+
+# --- Config ------------------------------------------------------------------
 AGENT_PATH="${NHERE_AGENT_PATH:-~/nhere/agent}"
 CMD="${1:-status}"
 
@@ -33,7 +52,7 @@ SSH_OPTS=(
   -p "$NHERE_PORT"
 )
 
-# Resolve target: prefer Tailscale hostname, fall back to profile IP
+# --- Resolve target: prefer Tailscale hostname, fall back to IP --------------
 resolve_target() {
   if tailscale ping -c 1 --timeout 4s "$NHERE_HOST" &>/dev/null 2>&1; then
     echo "$NHERE_HOST"
@@ -46,6 +65,7 @@ resolve_target() {
   fi
 }
 
+# --- Dispatch ----------------------------------------------------------------
 case "$CMD" in
   ping)
     TARGET="$(resolve_target)"

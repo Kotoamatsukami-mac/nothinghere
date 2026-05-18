@@ -15,13 +15,18 @@ battery_state() {
     bat_st="$(printf '%s' "$bat_raw" | grep -o '"status":[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/')"
     printf '%s%% %s' "${bat_pct:---}" "${bat_st:---}"
   else
-    echo "unknown (termux-battery-status not found)"
+    echo "unknown (termux-battery-status not found — install: pkg install termux-api)"
   fi
 }
 
 root_state() {
   command -v su >/dev/null 2>&1 || { echo "unavailable (su not found)"; return; }
-  root_id="$(timeout 3 su -c id 2>/dev/null | grep -o 'uid=[0-9]*' | head -1)"
+  # timeout is not guaranteed in Termux — use it only if present
+  if command -v timeout >/dev/null 2>&1; then
+    root_id="$(timeout 3 su -c id 2>/dev/null | grep -o 'uid=[0-9]*' | head -1)"
+  else
+    root_id="$(su -c id 2>/dev/null | grep -o 'uid=[0-9]*' | head -1)"
+  fi
   case "$root_id" in
     uid=0) echo "available" ;;
     "")    echo "unavailable" ;;
@@ -29,13 +34,18 @@ root_state() {
   esac
 }
 
-# Detect Tailscale via tun0 interface — CLI not required.
-# The phone runs Tailscale at system level; tun0 carries the Tailscale IP.
+# Detect Tailscale via tun0 interface.
+# Avoids Tailscale CLI — the app runs at system level; tun0 carries the IP.
+# Uses ifconfig tun0 first (simpler), falls back to ip addr (more common in Termux).
+# Original gawk match() replaced with POSIX awk — busybox/toybox awk compatible.
 tailscale_state() {
-  ts_ip="$(ifconfig 2>/dev/null | awk '
-    /tun0/       { found=1; next }
-    found && /inet / { match($0, /inet ([0-9.]+)/, a); print a[1]; exit }
-  ')"
+  ts_ip=""
+  if command -v ifconfig >/dev/null 2>&1; then
+    ts_ip="$(ifconfig tun0 2>/dev/null | awk '/inet /{print $2; exit}')"
+  fi
+  if [ -z "$ts_ip" ] && command -v ip >/dev/null 2>&1; then
+    ts_ip="$(ip -4 addr show tun0 2>/dev/null | awk '/inet /{split($2,a,"/"); print a[1]; exit}')"
+  fi
   if [ -n "$ts_ip" ]; then
     printf 'up  tun0  %s' "$ts_ip"
   else
@@ -43,24 +53,10 @@ tailscale_state() {
   fi
 }
 
-# DOCTRINE armed state:
-#   armed    — tailscale up + ssh reachable + agent answers
-#   degraded — reachable but at least one service weak or missing
-#   unknown  — cannot determine
+# DOCTRINE armed state
 armed_state() {
   ts="$(tailscale_state)"
-  rt="$(root_state)"
-
-  ts_up=0
-  printf '%s' "$ts" | grep -q '^up' && ts_up=1
-
-  # ssh reachable is always true here (you got through to run this)
-  # root not required for armed but tracked
-  if [ "$ts_up" = "1" ]; then
-    echo "armed"
-  else
-    echo "degraded (tailscale down)"
-  fi
+  printf '%s' "$ts" | grep -q '^up' && echo "armed" || echo "degraded (tailscale down)"
 }
 
 case "$CMD" in
