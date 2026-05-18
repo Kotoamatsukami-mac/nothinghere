@@ -84,6 +84,7 @@ function html(fields: Record<string, string>, raw: string, ts: string): string {
 <div class="actions">
   <button onclick="location.reload()">refresh</button>
   <button onclick="fetch('/ping').then(r=>r.text()).then(t=>alert(t))">ping</button>
+  <button onclick="fetch('/open-screen').then(r=>r.text()).then(t=>console.log(t))">open screen</button>
 </div>
 <table>${rows}</table>
 <div class="ts">last polled ${ts} · auto-refresh 10s</div>
@@ -97,6 +98,14 @@ const server = Deno.serve({ port: PORT, hostname: "127.0.0.1" }, async (req) => 
   if (url.pathname === "/ping") {
     const out = await runCtl("ping");
     return new Response(out, { headers: { "content-type": "text/plain" } });
+  }
+
+  if (url.pathname === "/open-screen") {
+    const adbHost = Deno.env.get("NHERE_HOST_IP") || "100.123.75.12";
+    new Deno.Command("sh", {
+      args: ["-c", `nohup scrcpy --tcpip=${adbHost}:5555 --window-title="nothing 3a pro" --stay-awake > /tmp/scrcpy.log 2>&1 &`],
+    }).spawn();
+    return new Response("scrcpy launched", { headers: { "content-type": "text/plain" } });
   }
 
   if (url.pathname === "/status.json") {
