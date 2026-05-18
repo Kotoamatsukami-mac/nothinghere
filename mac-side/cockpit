@@ -1,0 +1,120 @@
+#!/usr/bin/env -S deno run --allow-net --allow-run --allow-read --allow-env
+// mac-side/cockpit — tiny localhost status cockpit
+// Usage: deno run --allow-net --allow-run --allow-read --allow-env mac-side/cockpit
+// Or:    chmod +x mac-side/cockpit && ./mac-side/cockpit
+// Opens at http://localhost:7779
+
+const PORT = 7779;
+const SCRIPT_DIR = new URL(".", import.meta.url).pathname;
+const CTL = `${SCRIPT_DIR}ctl`;
+
+async function runCtl(cmd: string): Promise<string> {
+  try {
+    const proc = new Deno.Command("bash", {
+      args: [CTL, cmd],
+      stdout: "piped",
+      stderr: "piped",
+      cwd: SCRIPT_DIR,
+    });
+    const { stdout, stderr } = await proc.output();
+    const out = new TextDecoder().decode(stdout).trim();
+    const err = new TextDecoder().decode(stderr).trim();
+    return out || err || "(no output)";
+  } catch (e) {
+    return `error: ${e}`;
+  }
+}
+
+function parseStatus(raw: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  for (const line of raw.split("\n")) {
+    const m = line.match(/^(\w+):\s+(.*)/);
+    if (m) fields[m[1]] = m[2].trim();
+  }
+  return fields;
+}
+
+function stateColor(state: string): string {
+  if (state.startsWith("armed"))    return "#9d6dff";
+  if (state.startsWith("degraded")) return "#d97880";
+  if (state.startsWith("rescue"))   return "#f08898";
+  return "#4a3a6a";
+}
+
+function html(fields: Record<string, string>, raw: string, ts: string): string {
+  const state = fields["state"] ?? "unknown";
+  const rows = Object.entries(fields).map(([k, v]) => `
+    <tr>
+      <td class="key">${k}</td>
+      <td class="val" style="${k==="state"?`color:${stateColor(v)};font-weight:bold`:""}">
+        ${v}
+      </td>
+    </tr>`).join("");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="10">
+<title>nothinghere</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#080610;color:#cac0f0;font:13px/1.5 "JetBrains Mono",monospace;padding:28px 32px}
+  h1{font-size:14px;color:#9d6dff;letter-spacing:.08em;margin-bottom:20px}
+  .state-badge{display:inline-block;padding:3px 10px;border-radius:3px;
+    background:${stateColor(state)}22;color:${stateColor(state)};
+    font-size:12px;border:1px solid ${stateColor(state)}55;margin-bottom:20px}
+  table{border-collapse:collapse;width:100%;max-width:520px}
+  td{padding:5px 0;vertical-align:top}
+  .key{color:#4a3a6a;width:110px;padding-right:16px}
+  .val{color:#cac0f0}
+  .raw{margin-top:24px;color:#3d2d60;font-size:11px;white-space:pre}
+  .ts{margin-top:20px;color:#3d2d60;font-size:11px}
+  .actions{margin-bottom:24px;display:flex;gap:10px}
+  button{background:#141020;border:1px solid #3d2d60;color:#9d6dff;
+    padding:6px 14px;border-radius:3px;cursor:pointer;font:12px monospace;
+    transition:border-color .15s}
+  button:hover{border-color:#9d6dff}
+</style>
+</head>
+<body>
+<h1>nothinghere</h1>
+<div class="state-badge">${state}</div>
+<div class="actions">
+  <button onclick="location.reload()">refresh</button>
+  <button onclick="fetch('/ping').then(r=>r.text()).then(t=>alert(t))">ping</button>
+</div>
+<table>${rows}</table>
+<div class="ts">last polled ${ts} · auto-refresh 10s</div>
+</body>
+</html>`;
+}
+
+const server = Deno.serve({ port: PORT, hostname: "127.0.0.1" }, async (req) => {
+  const url = new URL(req.url);
+
+  if (url.pathname === "/ping") {
+    const out = await runCtl("ping");
+    return new Response(out, { headers: { "content-type": "text/plain" } });
+  }
+
+  if (url.pathname === "/status.json") {
+    const raw = await runCtl("status");
+    return new Response(JSON.stringify({ raw, fields: parseStatus(raw) }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // Default: status page
+  const raw = await runCtl("status");
+  const fields = parseStatus(raw);
+  const ts = new Date().toISOString();
+  return new Response(html(fields, raw, ts), {
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+});
+
+console.log(`cockpit → http://localhost:${PORT}`);
+// Open in default browser
+new Deno.Command("open", { args: [`http://localhost:${PORT}`] }).spawn();
