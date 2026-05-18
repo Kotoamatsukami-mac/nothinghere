@@ -5,7 +5,10 @@
 const PORT = 7779;
 const STREAM_DIR = "/tmp/nhere-stream";
 const RECORDINGS_DIR = new URL("../recordings", import.meta.url).pathname;
-const HOST_IP = Deno.env.get("NHERE_HOST_IP") ?? "100.123.75.12";
+const HOST_IP    = Deno.env.get("NHERE_HOST_IP") ?? "100.123.75.12";
+const NHERE_USER = Deno.env.get("NHERE_USER")    ?? "u0_a296";
+const NHERE_PORT = Deno.env.get("NHERE_PORT")    ?? "8022";
+const NHERE_KEY  = Deno.env.get("NHERE_KEY")     ?? (Deno.env.get("HOME") + "/.ssh/nhere_ed25519");
 const ADB_SERIAL = `${HOST_IP}:5555`;
 
 let relayPid: number | null = null;
@@ -30,8 +33,7 @@ async function run(cmd: string[]): Promise<{ ok: boolean; out: string }> {
 }
 
 async function getStatus(): Promise<Record<string, string>> {
-  const key = Deno.env.get("HOME") + "/.ssh/nhere_ed25519";
-  const r = await run(["ssh","-i",key,"-o","BatchMode=yes","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=5","-p","8022",`u0_a296@${HOST_IP}`,"sh ~/nhere/agent status"]);
+  const r = await run(["ssh","-i",NHERE_KEY,"-o","BatchMode=yes","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=5","-p",NHERE_PORT,`${NHERE_USER}@${HOST_IP}`,"su -c 'nhere status'"]);
   const fields: Record<string, string> = {};
   if (r.ok) {
     for (const line of r.out.split("\n")) {
@@ -255,8 +257,7 @@ async function handler(req: Request): Promise<Response> {
     return new Response(JSON.stringify({raw:Object.entries(fields).map(([k,v])=>`${k}:       ${v}`).join("\n"),fields}),{headers:{"Content-Type":"application/json","Cache-Control":"no-cache"}});
   }
   if (path==="/ping") {
-    const key=Deno.env.get("HOME")+"/.ssh/nhere_ed25519";
-    const r=await run(["ssh","-i",key,"-o","BatchMode=yes","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=5","-p","8022",`u0_a296@${HOST_IP}`,"true"]);
+    const r=await run(["ssh","-i",NHERE_KEY,"-o","BatchMode=yes","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=5","-p",NHERE_PORT,`${NHERE_USER}@${HOST_IP}`,"true"]);
     return new Response(r.ok?"reachable":"unreachable",{headers:{"Content-Type":"text/plain"}});
   }
   if (path==="/open-screen") {

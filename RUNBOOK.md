@@ -13,7 +13,7 @@
 
 **Phone (Nothing 3a Pro)**
 - Termux (F-Droid build)
-- Termux packages: `openssh`, `termux-api`
+- Termux packages: `openssh` (required); `termux-api` (optional — enables wakelock via `nhere arm`)
 - Magisk + nhere v2.0 module installed
 - Tailscale installed and logged in
 
@@ -47,7 +47,29 @@ Real `.conf` is gitignored. Never leaves your machine.
 
 ---
 
-## 3. Install nhere Magisk module (once per device)
+## 3. Termux clean-slate setup (after fresh install or reset)
+
+```bash
+pkg update -y && pkg upgrade -y
+pkg install -y openssh
+
+# Set a password (needed to push the SSH key in step 4)
+passwd
+
+# Start sshd so you can push the key from Mac
+sshd
+```
+
+Optional — wakelock support (`nhere arm` gracefully skips if absent):
+```bash
+pkg install -y termux-api
+```
+
+Confirm your Termux user: `whoami` — use this value for `NHERE_USER` in your profile.
+
+---
+
+## 4. Install nhere Magisk module (once per device)
 
 ```bash
 # On Mac — package the module
@@ -67,7 +89,7 @@ su -c 'nhere status'
 
 ---
 
-## 4. Push SSH key to phone (once)
+## 5. Push SSH key to phone (once)
 
 ```bash
 ssh-copy-id -i ~/.ssh/nhere_ed25519.pub -p 8022 USER@TAILSCALE_IP
@@ -75,7 +97,7 @@ ssh-copy-id -i ~/.ssh/nhere_ed25519.pub -p 8022 USER@TAILSCALE_IP
 
 ---
 
-## 5. Test connection
+## 6. Test connection
 
 ```bash
 ./mac-side/ctl ping
@@ -87,7 +109,7 @@ ssh-copy-id -i ~/.ssh/nhere_ed25519.pub -p 8022 USER@TAILSCALE_IP
 
 ---
 
-## 6. Bring everything up
+## 7. Bring everything up
 
 ```bash
 ~/Desktop/nothinghere/mac-side/up-n
@@ -101,7 +123,8 @@ ssh -i ~/.ssh/nhere_ed25519 -p 8022 USER@IP 'su -c "nhere arm"'
 # Start cockpit
 cd ~/Desktop/nothinghere
 source profiles/nothing-3a-pro.conf
-NHERE_HOST_IP="$NHERE_HOST_IP" deno run \
+NHERE_HOST_IP="$NHERE_HOST_IP" NHERE_USER="$NHERE_USER" \
+NHERE_PORT="$NHERE_PORT" NHERE_KEY="$NHERE_KEY" deno run \
   --allow-net --allow-run --allow-read --allow-env \
   mac-side/cockpit &
 
@@ -110,7 +133,7 @@ open http://localhost:7779
 
 ---
 
-## 7. Enable ADB TCP on demand
+## 8. Enable ADB TCP on demand
 
 ```bash
 # On phone (via SSH or Termux):

@@ -65,25 +65,18 @@ HEALTH="$(ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-n
     -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
     'echo ok' 2>/dev/null || echo fail)"
 if [ "$HEALTH" = "ok" ]; then
-  # Check stack status
-  SSHD_UP="$(ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+  STATUS="$(ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
       -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
-      'su -c "ss -ltnp 2>/dev/null | grep -c :8022 || echo 0"' 2>/dev/null || echo 0)"
-  TS_UP="$(ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-      -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
-      'su -c "ip link show tun0 2>/dev/null | grep -c UP || echo 0"' 2>/dev/null || echo 0)"
-  BAT="$(ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-      -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
-      'dumpsys battery 2>/dev/null | grep level | tr -d " " | cut -d: -f2' 2>/dev/null || echo '?')"
-  TS_LABEL="$([ "$TS_UP" -gt 0 ] 2>/dev/null && echo "up" || echo "DOWN")"
-  SSHD_LABEL="$([ "$SSHD_UP" -gt 0 ] 2>/dev/null && echo ":8022" || echo "DOWN")"
-  ok "phone health" "ssh✓  ts=$TS_LABEL  sshd=$SSHD_LABEL  bat=${BAT}%"
-  # If either is down, try to bring up
-  if [ "${TS_UP:-0}" -eq 0 ] || [ "${SSHD_UP:-0}" -eq 0 ]; then
-    warn "phone health" "stack incomplete — attempting recovery"
+      "su -c 'nhere status'" 2>/dev/null)"
+  SSHD_LABEL="$(printf '%s' "$STATUS" | awk '/^sshd:/{print $2}')"
+  TS_LABEL="$(printf '%s' "$STATUS" | awk '/^tailscale:/{print $2}')"
+  BAT="$(printf '%s' "$STATUS" | awk '/^battery:/{print $2}')"
+  ok "phone health" "ssh✓  ts=${TS_LABEL:-?}  sshd=${SSHD_LABEL:-?}  bat=${BAT:-?}"
+  if [ "${SSHD_LABEL}" = "down" ] || [ "${TS_LABEL}" = "down" ]; then
+    warn "phone health" "stack incomplete — attempting nhere arm"
     ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
         -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
-        "su -c 'am start -n com.tailscale.ipn/.MainActivity >/dev/null 2>&1; sleep 2; ss -ltnp | grep :8022 || su u0_a296 -c \"PATH=/data/data/com.termux/files/usr/bin:/system/bin sshd\"'" 2>/dev/null || true
+        "su -c 'nhere arm'" 2>/dev/null || true
     ok "phone health" "recovery attempted"
   fi
 else
@@ -96,7 +89,8 @@ if curl -sf --max-time 2 "$COCKPIT_URL/status.json" >/dev/null 2>&1; then
   ok "cockpit" "already running :7779"
 else
   cd "$REPO_ROOT"
-  NHERE_HOST_IP="$NHERE_HOST_IP" nohup deno run \
+  NHERE_HOST_IP="$NHERE_HOST_IP" NHERE_USER="$NHERE_USER" \
+  NHERE_PORT="$NHERE_PORT" NHERE_KEY="$NHERE_KEY" nohup deno run \
     --allow-net --allow-run --allow-read --allow-env \
     mac-side/cockpit >/tmp/cockpit.log 2>&1 &
   disown 2>/dev/null || true

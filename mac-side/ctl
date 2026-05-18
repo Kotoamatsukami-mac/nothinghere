@@ -41,7 +41,6 @@ source "$PROFILE_FILE"
        exit 1; }
 
 # --- Config ------------------------------------------------------------------
-AGENT_PATH="${NHERE_AGENT_PATH:-~/nhere/agent}"
 CMD="${1:-status}"
 
 SSH_OPTS=(
@@ -77,14 +76,14 @@ case "$CMD" in
     fi
     ;;
 
-  status)
+  status|arm|disarm|toggle|restart|relay-prep)
     TARGET="$(resolve_target)"
-    echo "--- $PROFILE ---"
-    ssh "${SSH_OPTS[@]}" "$NHERE_USER@$TARGET" "sh $AGENT_PATH status"
+    [ "$CMD" = "status" ] && printf '--- %s ---\n' "$PROFILE"
+    ssh "${SSH_OPTS[@]}" "$NHERE_USER@$TARGET" "su -c 'nhere $CMD'"
     ;;
 
   *)
-    echo "usage: ctl [ping|status]" >&2
+    echo "usage: ctl [ping|status|arm|disarm|toggle|restart|relay-prep]" >&2
     exit 1
     ;;
 esac

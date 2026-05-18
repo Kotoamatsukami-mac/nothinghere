@@ -33,6 +33,11 @@ Via ctl (preferred):
 ```bash
 ./mac-side/ctl ping
 ./mac-side/ctl status
+./mac-side/ctl arm
+./mac-side/ctl disarm
+./mac-side/ctl toggle
+./mac-side/ctl restart
+./mac-side/ctl relay-prep
 ```
 
 ## Phone-side nhere commands
@@ -69,7 +74,8 @@ Start manually:
 ```bash
 cd ~/Desktop/nothinghere
 source profiles/nothing-3a-pro.conf
-nohup env NHERE_HOST_IP="$NHERE_HOST_IP" \
+nohup env NHERE_HOST_IP="$NHERE_HOST_IP" NHERE_USER="$NHERE_USER" \
+  NHERE_PORT="$NHERE_PORT" NHERE_KEY="$NHERE_KEY" \
   deno run --allow-net --allow-run --allow-read --allow-env \
   mac-side/cockpit > /tmp/cockpit.log 2>&1 &
 ```

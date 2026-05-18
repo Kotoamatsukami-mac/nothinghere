@@ -38,7 +38,7 @@ run_termux() {
 # ── probes ───────────────────────────────────────────────────────────────────
 
 probe_sshd() {
-    pgrep -f "$SSHD_BIN" >/dev/null 2>&1 && echo "up :$SSHD_PORT" || echo "down"
+    pgrep sshd >/dev/null 2>&1 && echo "up :$SSHD_PORT" || echo "down"
 }
 
 probe_tailscale() {
@@ -53,8 +53,8 @@ probe_wakelock() {
 
 probe_battery() {
     raw="$(su -c "dumpsys battery 2>/dev/null" 2>/dev/null)"
-    pct="$(printf '%s' "$raw" | grep 'level:' | tr -dc '0-9')"
-    sta="$(printf '%s' "$raw" | grep 'status:' | tr -dc '0-9')"
+    pct="$(printf '%s' "$raw" | awk '/level:/{print $2; exit}')"
+    sta="$(printf '%s' "$raw" | awk '/status:/{print $2; exit}')"
     # status 2=charging 3=discharging 5=full
     case "$sta" in
         2) label="charging" ;; 5) label="full" ;; *) label="discharging" ;;
@@ -101,7 +101,7 @@ cmd_arm() {
     log "arm: begin"
 
     # sshd
-    if ! pgrep -f "$SSHD_BIN" >/dev/null 2>&1; then
+    if ! pgrep sshd >/dev/null 2>&1; then
         run_termux sshd && log "arm: sshd started" || log "arm: sshd start failed"
     else
         log "arm: sshd already running"
@@ -129,7 +129,7 @@ cmd_disarm() {
     write_state "disarmed"
 
     # delay sshd stop 2s — keeps SSH session alive long enough to ack
-    ( sleep 2; pkill -f "$SSHD_BIN" 2>/dev/null; log "disarm: sshd stopped" ) &
+    ( sleep 2; pkill sshd 2>/dev/null; log "disarm: sshd stopped" ) &
 
     # Tailscale: left up. Never forced down.
     log "disarm: tailscale left up"

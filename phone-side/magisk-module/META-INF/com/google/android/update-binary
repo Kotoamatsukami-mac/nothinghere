@@ -1,0 +1,4 @@
+#!/sbin/sh
+# Magisk detects #MAGISK in updater-script and uses its built-in module installer.
+# This stub exists for zip validity and legacy recovery compatibility.
+# Magisk auto-extracts all files and sources customize.sh.
