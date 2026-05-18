@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+source "$REPO_ROOT/profiles/nothing-3a-pro.conf" 2>/dev/null || { echo "profile missing"; exit 1; }
+COCKPIT_URL="http://localhost:7779"
+ADB_SERIAL="${NHERE_HOST_IP}:5555"
+
+G='\033[32m'; Y='\033[33m'; P='\033[35m'; R='\033[0m'
+
+printf "\n${P}  nothinghere${R}\n\n"
+
+# 1 tailscale
+printf "  [tailscale]  "
+tailscale status >/dev/null 2>&1 && printf "${G}✓${R} up\n" || { tailscale up 2>/dev/null; sleep 2; printf "${Y}~${R} starting\n"; }
+
+# 2 cockpit
+printf "  [cockpit]   "
+if curl -sf --max-time 1 "$COCKPIT_URL/status.json" >/dev/null 2>&1; then
+  printf "${G}✓${R} running\n"
+else
+  cd "$REPO_ROOT"
+  NHERE_HOST_IP="$NHERE_HOST_IP" nohup deno run --allow-net --allow-run --allow-read --allow-env mac-side/cockpit >/tmp/cockpit.log 2>&1 &
+  disown 2>/dev/null
+  for _ in $(seq 12); do sleep 1; curl -sf --max-time 1 "$COCKPIT_URL/status.json" >/dev/null 2>&1 && break; done
+  curl -sf --max-time 1 "$COCKPIT_URL/status.json" >/dev/null 2>&1 && printf "${G}✓${R} started\n" || printf "${Y}~${R} slow\n"
+fi
+
+# 3 adb — fire and forget
+printf "  [adb]       "
+adb connect "$ADB_SERIAL" >/dev/null 2>&1 &
+disown 2>/dev/null
+printf "${G}✓${R} %s\n" "$ADB_SERIAL"
+
+# 4 stream
+printf "  [stream]    "
+if curl -sf --max-time 2 "$COCKPIT_URL/stream.json" 2>/dev/null | grep -q '"alive":true'; then
+  printf "${G}✓${R} streaming\n"
+else
+  curl -sf --max-time 5 "$COCKPIT_URL/stream-start" >/dev/null 2>&1
+  printf "${G}✓${R} started\n"
+fi
+
+# 5 browser
+nohup open "$COCKPIT_URL" </dev/null >/dev/null 2>&1 &
+disown 2>/dev/null
+
+# summary
+state="$(curl -sf --max-time 2 "$COCKPIT_URL/status.json" 2>/dev/null | grep -o '"state":"[^"]*"' | cut -d'"' -f4)"
+printf "\n${P}  nothinghere ↗${R}  cockpit :7779  phone %s\n\n" "${state:-unknown}"

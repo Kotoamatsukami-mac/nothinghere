@@ -23,9 +23,10 @@ Termux provides the live userland services and tools. The Nothing Phone 3a Pro
 |---|---|
 | SSH over Tailscale | ✓ armed and reachable |
 | ADB over Tailscale | ✓ authorized, no USB required |
-| Cockpit :7779 | ✓ live — status, relay, record, screenshot |
+| Cockpit :7779 | ✓ live — status, relay, record, screenshot, stream embed |
 | Screen relay (scrcpy) | ✓ native window via cockpit |
-| `up-n` alias + stream embed | ⚙ in build — see docs/OPUS_SCOPE.md |
+| Embedded phone screen (HLS) | ✓ stream embed in cockpit right panel |
+| `up-n` alias + launcher | ✓ wired in ~/.zshrc, logic in mac-side/up |
 | `wakelock` real value | ⏳ deferred |
 | `ctl restart / wake / sleep` | ⏳ deferred |
 | `rescue` mode | ⏳ deferred |

@@ -2,15 +2,29 @@
 
 ## Current confirmed state
 
-| Field      | Value                        |
-|------------|------------------------------|
-| device     | Nothing A059P (Android 16)   |
-| state      | armed                        |
-| tailscale  | up  tun0  100.123.75.12      |
-| sshd       | listening :8022              |
-| root       | available (Magisk)           |
+| Field      | Value                          |
+|------------|--------------------------------|
+| device     | Nothing A059P (Android 16)     |
+| state      | armed                          |
+| tailscale  | up  tun0  100.123.75.12        |
+| sshd       | listening :8022                |
+| root       | available (Magisk)             |
 | adb        | authorized  100.123.75.12:5555 |
-| cockpit    | http://localhost:7779        |
+| cockpit    | http://localhost:7779          |
+| stream     | HLS on-demand via cockpit (two-column layout, right panel) |
+
+---
+
+## Quick launch
+
+```bash
+up-n
+```
+
+One command: Tailscale up → cockpit started → ADB connected → HLS stream
+started → browser opens at localhost:7779.
+
+Alias lives in `~/.zshrc`, logic lives in `mac-side/up`.
 
 ---
 
@@ -45,7 +59,7 @@ adb devices
 
 ## Cockpit
 
-Start:
+Start manually (if not using `up-n`):
 ```bash
 cd ~/Desktop/nothinghere
 source profiles/nothing-3a-pro.conf
@@ -54,19 +68,34 @@ nohup env NHERE_HOST_IP="$NHERE_HOST_IP" \
   mac-side/cockpit > /tmp/cockpit.log 2>&1 &
 ```
 
+Layout: two-column. Left panel: status + controls. Right panel: phone screen embed.
+
 Routes:
 | Route           | Action                                        |
 |-----------------|-----------------------------------------------|
-| `/`             | status page — auto-refresh 10s                |
+| `/`             | cockpit UI — two-column, auto-refresh 15s     |
 | `/status.json`  | structured JSON                               |
-| `/ping`         | ctl ping                                      |
-| `/open-screen`  | safe scrcpy launch — checks relay PID + ADB   |
+| `/ping`         | SSH reachability check                        |
+| `/open-screen`  | scrcpy native window launch                   |
 | `/close-screen` | SIGTERM relay                                 |
 | `/record`       | scrcpy --no-display --record → recordings/    |
 | `/stop-record`  | SIGTERM recording                             |
 | `/screenshot`   | adb screencap → recordings/shot-TIMESTAMP.png |
+| `/stream-start` | start HLS stream (adb+ffmpeg→/tmp/nhere-stream/) |
+| `/stream-stop`  | stop stream, clean segments                   |
+| `/stream.json`  | `{ alive: bool, pid: number }` |
+| `/stream/*`     | serve HLS segments (.m3u8 + .ts)              |
 
-Browser keyboard shortcuts: `S` screen · `R` record · `P` ping · `X` close · `Space` refresh
+Browser keyboard shortcuts:
+| Key | Action |
+|---|---|
+| `S` | open screen relay |
+| `R` | record |
+| `P` | ping |
+| `X` | close screen |
+| `V` | start stream |
+| `Q` | stop stream |
+| `Space` | refresh |
 
 Hammerspoon system hotkeys:
 | Hotkey        | Action           |
@@ -78,44 +107,84 @@ Hammerspoon system hotkeys:
 
 ---
 
+## Embedded phone screen stream
+
+The stream is Mac-side only. `adb exec-out screenrecord` pipes h264 to ffmpeg
+which outputs HLS segments to `/tmp/nhere-stream/`. Cockpit serves them at
+`/stream/*`. Browser plays via hls.js (CDN-loaded).
+
+Stream process:
+```
+adb exec-out screenrecord --output-format=h264 --time-limit=3600 -
+  | ffmpeg -re -i pipe:0 -c:v libx264 -preset ultrafast -tune zerolatency
+           -vf scale=540:-2 -f hls -hls_time 1 -hls_list_size 4
+           -hls_flags delete_segments+omit_endlist
+           /tmp/nhere-stream/stream.m3u8
+```
+
+Start: `up-n` (auto) or cockpit "Start Stream" button or `V` key.
+Stop: cockpit "Stop" button or `Q` key.
+Fullscreen: click ⛶ fullscreen button (bottom-right of video panel).
+
+---
+
 ## scrcpy
 
-Connects over ADB TCP at `100.123.75.12:5555`.
+Connects over ADB TCP at the Tailscale IP.
 Keyboard and mouse pass through to device by default.
 Recording saves to `recordings/rec-TIMESTAMP.mp4`.
 Screenshots save to `recordings/shot-TIMESTAMP.png`.
 
 ---
 
-## Detection notes (important for future patches)
+## Detection notes
 
 | Tool      | Available | Notes                                               |
 |-----------|-----------|-----------------------------------------------------|
 | ifconfig  | yes       | no per-interface arg — use `ifconfig` + awk flag    |
 | ip        | no        | not in this Termux install                          |
 | ss        | no        | not in this Termux install                          |
-| netstat   | yes       | `-an` only — Android blocks /proc/net without root  |
+| netstat   | yes       | `-an` only                                          |
 | pgrep     | yes       | used for sshd detection                             |
-| timeout   | yes       | present — used in root_state                        |
+| timeout   | yes       | present                                             |
 | dumpsys   | no        | not in Termux PATH — wakelock deferred              |
-| tailscale | yes (bin) | CLI cannot reach Android VPN daemon IPC from Termux |
+| tailscale | yes (bin) | CLI cannot reach Android VPN daemon from Termux     |
 
-Tailscale detected via `tun0` interface, not CLI.
-sshd detected via `pgrep -x sshd`, not netstat.
-PATH bootstrap required at top of agent for non-interactive SSH sessions.
+---
+
+## Magisk module state (last checked 2026-05-18)
+
+| Module | Flag |
+|---|---|
+| np3a_control | ✓ clean |
+| playintegrityfix | ✓ clean |
+| tricky_store | ✓ clean |
+| zygisksu | ✓ clean |
+| zygisk_lsposed | ✓ clean |
+| zygisk-detach | ✓ clean |
+| SH_Blocker | ✓ clean |
+| ViPER4Android-RE-Fork | ✓ clean |
+| iOS_Emoji | ✓ clean |
+| ace_sysctl_tune | ⚠ REMOVE flag set — will be deleted next reboot |
+| zn_magisk_compat | ⚠ REMOVE + DISABLE — will be deleted next reboot |
+
+`ace_sysctl_tune` and `zn_magisk_compat` are flagged for removal. This is expected if
+they were marked in Magisk Manager. They will be gone after the next reboot.
+All core modules (np3a_control, playintegrityfix, tricky_store, lsposed, zygisksu) are clean.
 
 ---
 
 ## What's deferred
 
-- `wakelock` — needs `su -c dumpsys power` path or `/proc/wakelocks` read
-- history scrub — real IP + username in commits a87489d and 3838b44 (private repo, low urgency)
-- service restart commands — `sshd`, tailscale restart via ctl (next surface)
-- `rescue` mode — manual recovery path documented but not wired
+- `wakelock` — needs `su -c dumpsys power` path
+- history scrub — real IP + username in early commits (private repo, low urgency)
+- service restart commands — `sshd`, tailscale restart via ctl
+- `rescue` mode — documented but not wired
 
 ## Constraints (DOCTRINE)
 
-- Owner-enrolled administration only — not a relay, not a backdoor
-- ADB debug path closes after use — not always-on
+- Owner-enrolled administration only
+- ADB debug path closes after use — not always-on at boot
+- Stream is on-demand, not persistent
 - No persistent shell sessions automated
 - All operator values in gitignored local profile only
