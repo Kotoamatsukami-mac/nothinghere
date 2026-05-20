@@ -1,34 +1,63 @@
 #!/system/bin/sh
-# nhere — command engine v2.0
+# nhere — command engine v2.1
 # No loops. No listeners. Called on demand only.
 # Lives at /system/bin/nhere (Magisk overlay) + /data/adb/nhere/nhere (boot copy)
 
 NHERE_DIR=/data/adb/nhere
 STATE_FILE="$NHERE_DIR/state"
+DESIRED_FILE="$NHERE_DIR/desired_state"
 LOG="$NHERE_DIR/nhere.log"
 TERMUX_BIN=/data/data/com.termux/files/usr/bin
-SSHD_BIN="$TERMUX_BIN/sshd"
 SSHD_PORT=8022
 
 # ── util ─────────────────────────────────────────────────────────────────────
 
-ts()          { date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; }
-log()         { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null; }
-die()         { echo "error: $*" >&2; exit 1; }
-read_state()  { [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || echo "unknown"; }
-write_state() { mkdir -p "$NHERE_DIR"; printf '%s\n' "$1" > "$STATE_FILE"; log "state -> $1"; }
+ts()           { date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; }
+log()          { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null; }
+die()          { echo "error: $*" >&2; exit 1; }
+read_state() { [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || echo "unknown"; }
 
-termux_uid() {
+# Upgrade compatibility: if desired_state is missing but a legacy `state` file
+# exists (v2.0 install), seed desired_state from state so the first `toggle`
+# after upgrade does the right thing. Falls back to "disarmed" only when both
+# are absent (genuine fresh install).
+read_desired() {
+    if [ -f "$DESIRED_FILE" ]; then
+        cat "$DESIRED_FILE"
+        return
+    fi
+    if [ -f "$STATE_FILE" ]; then
+        seed="$(cat "$STATE_FILE")"
+        case "$seed" in
+            armed|disarmed)
+                mkdir -p "$NHERE_DIR"
+                printf '%s\n' "$seed" > "$DESIRED_FILE" 2>/dev/null
+                log "desired seeded from state -> $seed"
+                echo "$seed"
+                return
+                ;;
+        esac
+    fi
+    echo "disarmed"
+}
+
+write_state()   { mkdir -p "$NHERE_DIR"; printf '%s\n' "$1" > "$STATE_FILE";   log "state -> $1"; }
+write_desired() { mkdir -p "$NHERE_DIR"; printf '%s\n' "$1" > "$DESIRED_FILE"; log "desired -> $1"; }
+
+# Safe variant: returns empty string on failure. Use this anywhere that must
+# not abort (disarm, probes). For arm-side hard requirement use termux_user().
+termux_user_safe() {
     uid="$(pm list packages -U com.termux 2>/dev/null \
         | grep 'package:com.termux ' \
         | sed -n 's/.*uid://p' | head -1 | tr -d '[:space:]')"
-    [ -z "$uid" ] && die "Termux UID not found"
-    echo "$uid"
+    [ -z "$uid" ] && return
+    echo "u0_a$((uid - 10000))"
 }
 
 termux_user() {
-    uid="$(termux_uid)"
-    echo "u0_a$((uid - 10000))"
+    user="$(termux_user_safe)"
+    [ -z "$user" ] && die "Termux UID not found (is Termux installed?)"
+    echo "$user"
 }
 
 run_termux() {
@@ -37,8 +66,27 @@ run_termux() {
 
 # ── probes ───────────────────────────────────────────────────────────────────
 
+# Detection contract:
+#   "Is the SSH listener accepting on port $SSHD_PORT?"
+# Implementation order (most accurate first):
+#   1. ss      — port-state via socket stats (toybox on Android 10+)
+#   2. netstat — fallback for older shells
+#   3. pgrep -u <termux_user> sshd — process check scoped to Termux UID
+# All checks are read-only and safe.
 probe_sshd() {
-    pgrep sshd >/dev/null 2>&1 && echo "up :$SSHD_PORT" || echo "down"
+    # Portable: awk avoids \b word-boundary which toybox grep treats literally.
+    if command -v ss >/dev/null 2>&1; then
+        ss -tln 2>/dev/null | awk -v p=":${SSHD_PORT}" '$0 ~ p { found=1 } END { exit !found }' && { echo "up :$SSHD_PORT"; return; }
+    fi
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -tln 2>/dev/null | awk -v p=":${SSHD_PORT}" '$0 ~ p { found=1 } END { exit !found }' && { echo "up :$SSHD_PORT"; return; }
+    fi
+    user="$(termux_user_safe)"
+    if [ -n "$user" ] && pgrep -u "$user" sshd >/dev/null 2>&1; then
+        echo "up :$SSHD_PORT"
+        return
+    fi
+    echo "down"
 }
 
 probe_tailscale() {
@@ -86,50 +134,72 @@ probe_root() {
 # ── commands ─────────────────────────────────────────────────────────────────
 
 cmd_status() {
-    state="$(read_state)"
-    printf 'state:      %s\n' "$state"
-    printf 'root:       %s\n' "$(probe_root)"
-    printf 'battery:    %s\n' "$(probe_battery)"
-    printf 'thermal:    %s\n' "$(probe_thermal)"
-    printf 'sshd:       %s\n' "$(probe_sshd)"
-    printf 'tailscale:  %s\n' "$(probe_tailscale)"
-    printf 'wakelock:   %s\n' "$(probe_wakelock)"
-    printf 'adb:        %s\n' "$(probe_adb)"
+    printf 'state:         %s\n' "$(read_state)"
+    printf 'desired_state: %s\n' "$(read_desired)"
+    printf 'root:          %s\n' "$(probe_root)"
+    printf 'battery:       %s\n' "$(probe_battery)"
+    printf 'thermal:       %s\n' "$(probe_thermal)"
+    printf 'sshd:          %s\n' "$(probe_sshd)"
+    printf 'tailscale:     %s\n' "$(probe_tailscale)"
+    printf 'wakelock:      %s\n' "$(probe_wakelock)"
+    printf 'adb:           %s\n' "$(probe_adb)"
 }
 
 cmd_arm() {
     log "arm: begin"
 
-    # sshd
-    if ! pgrep sshd >/dev/null 2>&1; then
-        run_termux sshd && log "arm: sshd started" || log "arm: sshd start failed"
+    # Start Termux sshd if listener is not up.
+    # Starting with absolute path keeps the cmdline consistent for any
+    # future process-based predicate, even though detection now uses port.
+    if [ "$(probe_sshd)" = "down" ]; then
+        run_termux "$TERMUX_BIN/sshd" && log "arm: sshd started" || log "arm: sshd start failed"
     else
-        log "arm: sshd already running"
+        log "arm: sshd already up on :$SSHD_PORT"
     fi
 
-    # wakelock — optional, best-effort via Termux API
+    # Wakelock — best-effort, requires termux-api package
     run_termux "termux-wake-lock 2>/dev/null" && log "arm: wakelock acquired" \
         || log "arm: wakelock unavailable (termux-api missing?)"
 
-    # Tailscale — report only, never force
+    # Tailscale — report only, never force a VPN change
     ts_state="$(probe_tailscale)"
     log "arm: tailscale=$ts_state"
 
-    write_state "armed"
+    write_desired "armed"
+    write_state   "armed"
     printf 'armed\nsshd: %s\ntailscale: %s\n' "$(probe_sshd)" "$ts_state"
 }
 
 cmd_disarm() {
     log "disarm: begin"
 
-    # release wakelock first
+    user="$(termux_user_safe)"
+
+    # Persist desired state immediately so a boot restore won't re-arm.
+    write_desired "disarmed"
+    write_state   "disarmed"
+
+    # Safety: if we cannot determine the Termux UID, do NOT kill anything.
+    # Killing scope-less here can take down system sshd on :22 or a recovery
+    # session. Hard rule: do not break SSH access.
+    if [ -z "$user" ]; then
+        log "disarm: Termux user lookup failed — sshd NOT touched"
+        printf 'disarmed (sshd left running — Termux user lookup failed)\n'
+        printf 'manual recovery if needed:\n  ps -ef | grep sshd\n  kill <pid>\n' >&2
+        return
+    fi
+
+    # Release wakelock (scoped to Termux user)
     run_termux "termux-wake-unlock 2>/dev/null" && log "disarm: wakelock released" \
         || log "disarm: wakelock release skipped"
 
-    write_state "disarmed"
-
-    # delay sshd stop 2s — keeps SSH session alive long enough to ack
-    ( sleep 2; pkill sshd 2>/dev/null; log "disarm: sshd stopped" ) &
+    # Termination contract:
+    #   Stop Termux-owned sshd (listener + session children) only.
+    # `pkill -u $user sshd` catches both the daemon and `sshd: u0_a..@pts/..`
+    # session children, because they all run as the Termux user. It never
+    # matches root-owned (system) sshd, even if any happens to be running.
+    # 2 s delay keeps the issuing SSH session alive long enough to ack.
+    ( sleep 2; pkill -u "$user" sshd 2>/dev/null; log "disarm: sshd stopped (user-scoped)" ) &
 
     # Tailscale: left up. Never forced down.
     log "disarm: tailscale left up"
@@ -138,8 +208,9 @@ cmd_disarm() {
 }
 
 cmd_toggle() {
-    state="$(read_state)"
-    case "$state" in
+    # Toggle reads desired_state so the user's intent flips even if observed
+    # state has drifted (e.g. sshd crashed since last arm).
+    case "$(read_desired)" in
         armed)    cmd_disarm ;;
         *)        cmd_arm    ;;
     esac
@@ -175,7 +246,7 @@ case "$CMD" in
     restart)     cmd_restart     ;;
     relay-prep)  cmd_relay_prep  ;;
     *)
-        printf 'nhere v2.0\nusage: nhere <status|arm|disarm|toggle|restart|relay-prep>\n' >&2
+        printf 'nhere v2.1\nusage: nhere <status|arm|disarm|toggle|restart|relay-prep>\n' >&2
         exit 1
         ;;
 esac

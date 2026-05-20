@@ -1,14 +1,27 @@
-#!/usr/bin/env -S deno run --allow-net --allow-run --allow-read --allow-env
-// mac-side/cockpit — nothinghere v1.1
+#!/usr/bin/env -S deno run --allow-net --allow-run --allow-read --allow-env --allow-write=/tmp/nhere-stream
+// mac-side/cockpit — nothinghere v1.2
 // Deno HTTP server :7779
+// Permissions are explicit: write is scoped to /tmp/nhere-stream only.
 
 const PORT = 7779;
 const STREAM_DIR = "/tmp/nhere-stream";
 const RECORDINGS_DIR = new URL("../recordings", import.meta.url).pathname;
-const HOST_IP    = Deno.env.get("NHERE_HOST_IP") ?? "100.123.75.12";
-const NHERE_USER = Deno.env.get("NHERE_USER")    ?? "";
-const NHERE_PORT = Deno.env.get("NHERE_PORT")    ?? "8022";
-const NHERE_KEY  = Deno.env.get("NHERE_KEY")     ?? (Deno.env.get("HOME") + "/.ssh/nhere_ed25519");
+const _hostIpRaw = Deno.env.get("NHERE_HOST_IP");
+if (!_hostIpRaw) {
+  console.error([
+    "error: NHERE_HOST_IP is not set.",
+    "  fix one of:",
+    "    1) launch via:   ./mac-side/up-n        (recommended)",
+    "    2) export first: source profiles/nothing-3a-pro.conf && ./mac-side/cockpit",
+    "    3) inline env:   NHERE_HOST_IP=... NHERE_USER=... NHERE_KEY=... ./mac-side/cockpit",
+    "  (profile must use `export VAR=...` for source to work — see profiles/*.example.conf)",
+  ].join("\n"));
+  Deno.exit(1);
+}
+const HOST_IP = _hostIpRaw;
+const NHERE_USER = Deno.env.get("NHERE_SSH_USER") ?? Deno.env.get("NHERE_USER") ?? "";
+const NHERE_PORT = Deno.env.get("NHERE_SSH_PORT") ?? Deno.env.get("NHERE_PORT") ?? "8022";
+const NHERE_KEY  = Deno.env.get("NHERE_SSH_KEY")  ?? Deno.env.get("NHERE_KEY")  ?? (Deno.env.get("HOME") + "/.ssh/nhere_ed25519");
 const ADB_SERIAL = `${HOST_IP}:5555`;
 
 let relayPid: number | null = null;
@@ -32,16 +45,70 @@ async function run(cmd: string[]): Promise<{ ok: boolean; out: string }> {
   } catch (e) { return { ok: false, out: String(e) }; }
 }
 
+// ── nhere control plane ──────────────────────────────────────────────────────
+// Whitelist of nhere sub-commands the cockpit will execute. Defense-in-depth
+// against any future code that might forward an HTTP path or user input.
+const NHERE_ALLOWED = new Set(["status", "arm", "disarm", "relay-prep"]);
+
+type NherePath = "ssh" | "adb" | "none";
+interface NhereResult { ok: boolean; out: string; path: NherePath; err?: string; }
+
+async function nhereOverSsh(sub: string): Promise<NhereResult> {
+  if (!NHERE_ALLOWED.has(sub)) return { ok:false, out:"", path:"ssh", err:"disallowed: " + sub };
+  // Args are passed as a Deno argv array; only the trailing `su -c 'nhere <sub>'`
+  // is a single string interpreted by the remote shell. `sub` is allowlisted, so
+  // no injection vector exists.
+  const r = await run(["ssh","-i",NHERE_KEY,"-o","BatchMode=yes","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=6","-p",NHERE_PORT,`${NHERE_USER}@${HOST_IP}`,`su -c 'nhere ${sub}'`]);
+  return { ok: r.ok, out: r.out, path: "ssh" };
+}
+
+async function nhereOverAdb(sub: string): Promise<NhereResult> {
+  if (!NHERE_ALLOWED.has(sub)) return { ok:false, out:"", path:"adb", err:"disallowed: " + sub };
+  // Best-effort reconnect; harmless when already connected.
+  await run(["adb","connect",ADB_SERIAL]);
+  // adb shell joins its trailing argv into a remote shell command. `sub` is
+  // allowlisted; no injection.
+  const r = await run(["adb","-s",ADB_SERIAL,"shell","su","-c",`nhere ${sub}`]);
+  return { ok: r.ok, out: r.out, path: "adb" };
+}
+
+// Control-path safety: SSH-first, ADB fallback. Returns the path that worked
+// so callers/UI can show it to the operator.
+async function nhereSafe(sub: string): Promise<NhereResult> {
+  if (!NHERE_ALLOWED.has(sub)) return { ok:false, out:"", path:"none", err:"disallowed: " + sub };
+  const s = await nhereOverSsh(sub);
+  if (s.ok) return s;
+  const a = await nhereOverAdb(sub);
+  if (a.ok) return a;
+  return {
+    ok: false,
+    path: "none",
+    out: `--- ssh ---\n${s.out}\n--- adb ---\n${a.out}`,
+    err: "both ssh and adb failed",
+  };
+}
+
 async function getStatus(): Promise<Record<string, string>> {
-  const r = await run(["ssh","-i",NHERE_KEY,"-o","BatchMode=yes","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=5","-p",NHERE_PORT,`${NHERE_USER}@${HOST_IP}`,"su -c 'nhere status'"]);
+  // Status uses the same safe runner so the cockpit stays informative even
+  // after OFF (when SSH is intentionally down but ADB fallback may be up).
+  const r = await nhereSafe("status");
   const fields: Record<string, string> = {};
+  fields["target"] = `${NHERE_USER}@${HOST_IP}:${NHERE_PORT}`;
+  fields["via"] = r.path;
   if (r.ok) {
     for (const line of r.out.split("\n")) {
       const m = line.match(/^(\w+):\s+(.+)$/);
       if (m) fields[m[1]] = m[2];
     }
-  } else { fields["state"] = "unreachable"; fields["error"] = r.out.slice(0, 120); }
+  } else {
+    fields["state"] = "unreachable";
+    fields["error"] = (r.out || r.err || "").slice(0, 200);
+  }
   return fields;
+}
+
+async function scrcpyInstalled(): Promise<boolean> {
+  return (await run(["which", "scrcpy"])).ok;
 }
 
 async function startStream(): Promise<string> {
@@ -87,12 +154,15 @@ function buildHtml(fields: Record<string, string>, streamOn: boolean, relayAlive
   const wakelock = fields["wakelock"] ?? "—";
   const time = fields["time"] ?? "—";
 
-  // Normalise raw state → LIVE / DEGRADED / DEAD
-  const isLive     = rawState === "armed";
-  const isDegraded = rawState === "degraded";
-  const state      = isLive ? "LIVE" : isDegraded ? "DEGRADED" : "DEAD";
-  const sc         = isLive ? "#facc15" : isDegraded ? "#fb923c" : "#4a4068";
-  const bodyClass  = isLive ? "state-live" : isDegraded ? "state-degraded" : "state-dead";
+  // Normalise raw state → LIVE / OFF / UNKNOWN
+  // armed     → LIVE (yellow)
+  // disarmed  → OFF (dim)
+  // anything else (unreachable, unknown, missing) → UNKNOWN (amber)
+  const isLive    = rawState === "armed";
+  const isOff     = rawState === "disarmed";
+  const state     = isLive ? "LIVE" : isOff ? "OFF" : "UNKNOWN";
+  const sc        = isLive ? "#facc15" : isOff ? "#4a4068" : "#fb923c";
+  const bodyClass = isLive ? "state-live" : isOff ? "state-off" : "state-unknown";
 
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>nothinghere</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
@@ -105,14 +175,14 @@ body{display:flex;flex-direction:column;min-height:100vh}
 /* ── state-driven lightning bar (GPU-only, no JS) ── */
 body::before{content:'';display:block;height:3px;position:fixed;top:0;left:0;right:0;z-index:100;transition:opacity .6s}
 .state-live::before{background:linear-gradient(90deg,transparent 0%,#facc15 20%,#fef08a 50%,#facc15 80%,transparent 100%);background-size:200% 100%;animation:bolt-slide 1.4s linear infinite;opacity:1;box-shadow:0 0 8px 2px #facc1566}
-.state-degraded::before{background:linear-gradient(90deg,transparent,#fb923c,transparent);background-size:200% 100%;animation:bolt-slide 2.8s linear infinite;opacity:.6}
-.state-dead::before{background:#1e1830;animation:none;opacity:.35;box-shadow:none}
+.state-unknown::before{background:linear-gradient(90deg,transparent,#fb923c,transparent);background-size:200% 100%;animation:bolt-slide 2.8s linear infinite;opacity:.6}
+.state-off::before{background:#1e1830;animation:none;opacity:.35;box-shadow:none}
 @keyframes bolt-slide{0%{background-position:200% 0}100%{background-position:-200% 0}}
 
 /* ── jagged SVG bolt overlay (pure CSS, no engine) ── */
 .lw{position:fixed;inset:0;pointer-events:none;z-index:1;overflow:hidden}
-.state-dead .lw{opacity:0}
-.state-degraded .lw{opacity:.12}
+.state-off .lw{opacity:0}
+.state-unknown .lw{opacity:.12}
 .state-live .lw{opacity:1}
 .lw svg{position:absolute;width:100%;height:100%}
 .bolt{stroke-dasharray:500;stroke-dashoffset:500;animation:draw-bolt 1.8s ease-in-out infinite}
@@ -163,8 +233,20 @@ video{max-width:100%;max-height:100%;display:block;object-fit:contain}
 <header><h1><span>◈</span>nothinghere</h1><div class="hr"><span class="ts">${time.slice(11,19)} UTC</span><span class="badge">${state}</span></div></header>
 <main>
 <div class="left">
+<div class="card"><h2>Control</h2><div class="br">
+<button class="btn${isLive?" on":""}" onclick="apiReload('/arm')">LIVE</button>
+<button class="btn${isOff?" off":""}" onclick="apiReload('/disarm')">OFF</button>
+<button class="btn" onclick="apiShow('/status')">STATUS</button>
+</div>
+<div style="height:6px"></div>
+<div class="br">
+<button class="btn${relayAlive?" on":""}" onclick="apiReload('/open-screen')">OPEN SCREEN</button>
+</div></div>
 <div class="card"><h2>Phone Status</h2><div class="sg">
+<div class="sr"><span class="sk">target</span><span class="sv">${(fields["target"] ?? "phone")}</span></div>
+<div class="sr"><span class="sk">via</span><span class="sv${(fields["via"] ?? "")==="adb"?" pk":""}">${fields["via"] ?? "—"}</span></div>
 <div class="sr"><span class="sk">state</span><span class="sv hi">${state}</span></div>
+<div class="sr"><span class="sk">desired</span><span class="sv">${fields["desired_state"] ?? "—"}</span></div>
 <div class="sr"><span class="sk">battery</span><span class="sv${battery.includes("Charging")?" pk":""}">${battery}</span></div>
 <div class="sr"><span class="sk">root</span><span class="sv">${root}</span></div>
 <div class="sr"><span class="sk">tailscale</span><span class="sv">${ts}</span></div>
@@ -172,19 +254,22 @@ video{max-width:100%;max-height:100%;display:block;object-fit:contain}
 <div class="sr"><span class="sk">wakelock</span><span class="sv">${wakelock}</span></div>
 </div></div>
 <div class="card"><h2>Screen Relay</h2><div class="br">
-<button class="btn${relayAlive?" on":""}" onclick="api('/open-screen')">Open Screen</button>
-<button class="btn${relayAlive?" off":""}" onclick="api('/close-screen')">Close</button>
+<button class="btn${relayAlive?" on":""}" onclick="apiReload('/open-screen')">Open Screen</button>
+<button class="btn${relayAlive?" off":""}" onclick="apiReload('/close-screen')">Close</button>
 </div></div>
 <div class="card"><h2>Stream Embed</h2><div class="br">
 <button class="btn${streamOn?" on":""}" onclick="streamStart()">Start Stream</button>
 <button class="btn${streamOn?" off":""}" onclick="streamStop()">Stop</button>
 </div></div>
 <div class="card"><h2>Capture</h2>
-<div class="br"><button class="btn${recAlive?" on":""}" onclick="api('/record')">Record</button><button class="btn${recAlive?" off":""}" onclick="api('/stop-record')">Stop Rec</button></div>
+<div class="br"><button class="btn${recAlive?" on":""}" onclick="apiReload('/record')">Record</button><button class="btn${recAlive?" off":""}" onclick="apiReload('/stop-record')">Stop Rec</button></div>
 <div style="height:6px"></div>
-<div class="br"><button class="btn" onclick="api('/screenshot')">Screenshot</button><button class="btn" onclick="api('/ping')">Ping</button></div>
+<div class="br"><button class="btn" onclick="apiShow('/screenshot')">Screenshot</button><button class="btn" onclick="apiShow('/ping')">Ping</button></div>
 </div>
 <div class="card"><h2>Keys</h2><div class="scl">
+<div class="sc"><span class="sck">L</span><span class="scl2">live (arm)</span></div>
+<div class="sc"><span class="sck">O</span><span class="scl2">off (disarm)</span></div>
+<div class="sc"><span class="sck">T</span><span class="scl2">status</span></div>
 <div class="sc"><span class="sck">S</span><span class="scl2">open screen</span></div>
 <div class="sc"><span class="sck">X</span><span class="scl2">close screen</span></div>
 <div class="sc"><span class="sck">V</span><span class="scl2">start stream</span></div>
@@ -193,6 +278,11 @@ video{max-width:100%;max-height:100%;display:block;object-fit:contain}
 <div class="sc"><span class="sck">P</span><span class="scl2">ping</span></div>
 <div class="sc"><span class="sck">Space</span><span class="scl2">refresh</span></div>
 </div></div>
+<div class="card"><h2>Console</h2>
+<pre id="con" style="white-space:pre-wrap;word-break:break-word;font-size:11px;color:var(--wd);max-height:160px;overflow:auto;margin:0">ready</pre>
+<div style="height:6px"></div>
+<div id="err" style="font-size:11px;color:#fca5a5;white-space:pre-wrap;display:none"></div>
+</div>
 </div>
 <div class="right">
 <div class="sh"><span class="st">Phone Screen — Nothing 3a Pro</span><div class="sa"><button class="btn" style="min-width:unset;flex:unset;font-size:10px;padding:4px 10px" onclick="streamStart()">▶ Stream</button></div></div>
@@ -217,20 +307,40 @@ function setupHls(){
 }
 function setOnline(){document.getElementById('vid').style.display='';document.getElementById('op').style.display='none';setupHls();}
 function setOffline(){document.getElementById('vid').style.display='none';document.getElementById('op').style.display='';if(hls){hls.destroy();hls=null;}}
-async function streamStart(){const r=await fetch('/stream-start');const t=await r.text();if(t.startsWith('ok'))setOnline();}
-async function streamStop(){await fetch('/stream-stop');setOffline();}
-async function api(route){await fetch(route);setTimeout(()=>location.reload(),600);}
+function logCon(msg){const el=document.getElementById('con');if(el){el.textContent=msg;el.scrollTop=el.scrollHeight;}}
+function logErr(msg){const el=document.getElementById('err');if(!el)return;if(msg){el.textContent=msg;el.style.display='';}else{el.textContent='';el.style.display='none';}}
+async function fetchText(route){
+  try{const r=await fetch(route);const t=(await r.text()).trim();if(!r.ok){logErr(route+': '+(t||r.status));return null;}logErr('');return t;}
+  catch(e){logErr(route+': '+String(e));return null;}
+}
+async function apiShow(route){logCon(route+'...');const t=await fetchText(route);if(t!==null)logCon(t);}
+async function apiReload(route){logCon(route+'...');const t=await fetchText(route);if(t!==null){logCon(t);setTimeout(()=>location.reload(),600);}}
+async function streamStart(){
+  logCon('/stream-start...');
+  const t=await fetchText('/stream-start');
+  if(!t||!t.startsWith('ok')){if(t!==null)logCon(t);return;}
+  logCon(t+'\nwaiting for manifest...');
+  // Action-scoped retry: poll the manifest every 300 ms for up to ~7 s.
+  // Runs ONLY after the user pressed Start Stream — not a global polling loop.
+  const deadline=Date.now()+7200;
+  while(Date.now()<deadline){
+    try{const r=await fetch('/stream/stream.m3u8',{cache:'no-store'});if(r.ok){logCon(t+'\nmanifest ready');logErr('');setOnline();return;}}catch{}
+    await new Promise(r=>setTimeout(r,300));
+  }
+  logErr('stream process started but manifest not ready after ~7s. Check /tmp/cockpit.log, then press Start Stream again.');
+}
+async function streamStop(){logCon('/stream-stop...');const t=await fetchText('/stream-stop');if(t!==null)logCon(t);setOffline();}
 function toggleFs(){const w=document.getElementById('vw');document.fullscreenElement?document.exitFullscreen():w.requestFullscreen().catch(()=>{});}
 document.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT')return;
   switch(e.key.toUpperCase()){
-    case'S':api('/open-screen');break;case'X':api('/close-screen');break;
+    case'L':apiReload('/arm');break;case'O':apiReload('/disarm');break;case'T':apiShow('/status');break;
+    case'S':apiReload('/open-screen');break;case'X':apiReload('/close-screen');break;
     case'V':streamStart();break;case'Q':streamStop();break;
-    case'R':api('/record');break;case'P':api('/ping');break;
+    case'R':apiShow('/record');break;case'P':apiShow('/ping');break;
     case' ':e.preventDefault();location.reload();break;
   }
 });
-setInterval(async()=>{try{const r=await fetch('/stream.json');const j=await r.json();if(!j.alive&&hls)setOffline();else if(j.alive&&!hls)setOnline();}catch{}},5000);
 ${streamOn?"setOnline();":""}
 </script></body></html>`;
 }
@@ -256,14 +366,67 @@ async function handler(req: Request): Promise<Response> {
     const fields=await getStatus();
     return new Response(JSON.stringify({raw:Object.entries(fields).map(([k,v])=>`${k}:       ${v}`).join("\n"),fields}),{headers:{"Content-Type":"application/json","Cache-Control":"no-cache"}});
   }
+  // LIVE — try SSH first, fall back to ADB. Re-armable even after OFF as long
+  // as ADB TCP was bootstrapped before disarm (the /disarm precheck below
+  // enforces that, but ADB may also be enabled manually).
+  if (path === "/arm") {
+    const r = await nhereSafe("arm");
+    const body = `[path=${r.path}]\n${r.out || r.err || "arm ok"}`;
+    return new Response(body, { status: r.ok ? 200 : 502, headers: { "Content-Type": "text/plain" } });
+  }
+
+  // OFF — guarded. Hard rule: the cockpit must not disable its only control
+  // path. We refuse the disarm unless an ADB fallback is confirmed reachable.
+  if (path === "/disarm") {
+    let adbCheck = await nhereOverAdb("status");
+    if (!adbCheck.ok) {
+      // Try to bootstrap ADB TCP via the still-up SSH connection, then retry.
+      const relay = await nhereOverSsh("relay-prep");
+      if (relay.ok) {
+        await new Promise((r) => setTimeout(r, 2500));
+        adbCheck = await nhereOverAdb("status");
+      }
+    }
+    if (!adbCheck.ok) {
+      const msg = [
+        "OFF refused: SSH would be stopped and no ADB fallback is reachable.",
+        "Run relay-prep, connect USB ADB, or use physical Termux recovery.",
+      ].join("\n");
+      return new Response(msg, { status: 412, headers: { "Content-Type": "text/plain" } });
+    }
+    // ADB fallback confirmed. Run the actual disarm over ADB so the response
+    // path is not killed by sshd shutdown.
+    const r = await nhereOverAdb("disarm");
+    const body = `[path=${r.path}]\n${r.out || (r.ok ? "disarm ok" : "disarm failed")}`;
+    return new Response(body, { status: r.ok ? 200 : 500, headers: { "Content-Type": "text/plain" } });
+  }
+
+  // STATUS — same SSH-first / ADB-fallback contract as /arm.
+  if (path === "/status") {
+    const r = await nhereSafe("status");
+    const body = `[path=${r.path}]\n${r.out || r.err || ""}`;
+    return new Response(body, { status: r.ok ? 200 : 502, headers: { "Content-Type": "text/plain" } });
+  }
+
+  // RELAY-PREP — manual recovery: turn on ADB TCP via SSH. Useful before any
+  // OFF if the operator has not pre-armed an ADB fallback.
+  if (path === "/relay-prep") {
+    const r = await nhereSafe("relay-prep");
+    const body = `[path=${r.path}]\n${r.out || r.err || ""}`;
+    return new Response(body, { status: r.ok ? 200 : 502, headers: { "Content-Type": "text/plain" } });
+  }
   if (path==="/ping") {
     const r=await run(["ssh","-i",NHERE_KEY,"-o","BatchMode=yes","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=5","-p",NHERE_PORT,`${NHERE_USER}@${HOST_IP}`,"true"]);
     return new Response(r.ok?"reachable":"unreachable",{headers:{"Content-Type":"text/plain"}});
   }
   if (path==="/open-screen") {
     if (isPidAlive(relayPid)) return new Response(`relay running pid=${relayPid}`,{headers:{"Content-Type":"text/plain"}});
+    if (!(await scrcpyInstalled())) {
+      return new Response("scrcpy not installed\n  install: brew install scrcpy", {status:500, headers:{"Content-Type":"text/plain"}});
+    }
     await run(["adb","connect",ADB_SERIAL]);
-    const p=new Deno.Command("scrcpy",{args:["-s",ADB_SERIAL,"--window-title","nothing 3a pro"],stdout:"null",stderr:"null",stdin:"null"}).spawn();
+    // Spawn detached so scrcpy does NOT block the cockpit server.
+    const p=new Deno.Command("scrcpy",{args:["-s",ADB_SERIAL,"--window-title","Nothing Here Live"],stdout:"null",stderr:"null",stdin:"null"}).spawn();
     relayPid=p.pid;
     p.status.then(()=>{relayPid=null;}).catch(()=>{relayPid=null;});
     return new Response(`ok pid=${relayPid}`,{headers:{"Content-Type":"text/plain"}});
@@ -271,6 +434,9 @@ async function handler(req: Request): Promise<Response> {
   if (path==="/close-screen") { killPid(relayPid); relayPid=null; return new Response("closed",{headers:{"Content-Type":"text/plain"}}); }
   if (path==="/record") {
     if (isPidAlive(recordingPid)) return new Response("already recording",{headers:{"Content-Type":"text/plain"}});
+    if (!(await scrcpyInstalled())) {
+      return new Response("scrcpy not installed\n  install: brew install scrcpy", {status:500, headers:{"Content-Type":"text/plain"}});
+    }
     await run(["adb","connect",ADB_SERIAL]);
     const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
     const out=`${RECORDINGS_DIR}/rec-${ts}.mp4`;

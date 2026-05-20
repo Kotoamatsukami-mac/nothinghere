@@ -1,7 +1,7 @@
 id=nhere
 name=nhere
-version=v2.0
-versionCode=200
+version=v2.1
+versionCode=201
 author=Emperor
 description=nhere command engine — arm/disarm/status/relay-prep. No daemons. No watchers.
 updateJson=

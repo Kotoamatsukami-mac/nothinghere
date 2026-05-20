@@ -5,8 +5,8 @@
 | Field     | Value                           |
 |-----------|---------------------------------|
 | device    | Nothing A059P (Android 16)      |
-| module    | nhere v2.0 (Magisk)             |
-| tailscale | up  tun0  100.123.75.12         |
+| module    | nhere v2.1 (Magisk)             |
+| tailscale | up  tun0  (see profile)         |
 | sshd      | listening :8022                 |
 | root      | available (Magisk)              |
 | adb       | on-demand via relay-prep        |
@@ -46,12 +46,33 @@ All run via `su -c nhere <cmd>` in Termux or SSH:
 
 | Command          | Effect                                              |
 |------------------|-----------------------------------------------------|
-| `nhere status`   | root, battery, thermal, sshd, Tailscale, wakelock, ADB |
-| `nhere arm`      | start sshd, acquire wakelock, report Tailscale, write state=armed |
-| `nhere disarm`   | release wakelock, stop sshd (2s delay), keep Tailscale up, write state=disarmed |
-| `nhere toggle`   | arm if disarmed, disarm if armed                   |
+| `nhere status`   | state, desired_state, root, battery, thermal, sshd (port-checked), Tailscale, wakelock, ADB |
+| `nhere arm`      | start Termux sshd, acquire wakelock, report Tailscale; write desired_state=armed and state=armed |
+| `nhere disarm`   | release wakelock; stop sshd scoped to Termux user (2s delay, listener + sessions); keep Tailscale up; write desired_state=disarmed |
+| `nhere toggle`   | flips desired_state — arm if disarmed, disarm if armed |
 | `nhere restart`  | disarm → 3s → arm                                  |
 | `nhere relay-prep` | enable ADB TCP :5555 on demand                   |
+
+`desired_state` persists across reboots. On boot, `service.sh` reads
+`/data/adb/nhere/desired_state` and performs a one-shot `nhere arm` if it
+contains `armed`. There is no resident daemon — service.sh exits immediately
+after the one-shot call.
+
+### Future external triggers
+
+A future button-mapper app, Tasker job, Quick Settings tile, or Shortcuts
+intent can call the same commands from any rooted shell context:
+
+```
+su -c 'nhere toggle'
+su -c 'nhere arm'
+su -c 'nhere disarm'
+```
+
+The Magisk module deliberately ships **no** button listener, getevent loop,
+SystemUI patch, power-menu hook, or polling daemon. Any "double-press" or
+"power menu Live/Off" UX must be implemented as an external wrapper that
+shells out to `nhere`.
 
 ## ADB
 
@@ -77,6 +98,7 @@ source profiles/nothing-3a-pro.conf
 nohup env NHERE_HOST_IP="$NHERE_HOST_IP" NHERE_USER="$NHERE_USER" \
   NHERE_PORT="$NHERE_PORT" NHERE_KEY="$NHERE_KEY" \
   deno run --allow-net --allow-run --allow-read --allow-env \
+  --allow-write=/tmp/nhere-stream \
   mac-side/cockpit > /tmp/cockpit.log 2>&1 &
 ```
 
@@ -97,13 +119,16 @@ Routes:
 | `/stream/*`     | serve HLS segments                            |
 
 Cockpit visual states:
-- **LIVE** — armed. Yellow lightning bar, glow badge, bolt SVG overlay.
-- **DEGRADED** — reachable but sshd/Tailscale/wakelock missing. Orange.
-- **DEAD** — disarmed or unreachable. Dim, frozen.
+- **LIVE** — `state=armed`. Yellow lightning bar, glow badge, bolt SVG overlay.
+- **OFF** — `state=disarmed`. Dim, frozen.
+- **UNKNOWN** — unreachable or any other value. Amber.
 
 Browser keyboard shortcuts:
 | Key   | Action          |
 |-------|-----------------|
+| `L`   | LIVE (arm)      |
+| `O`   | OFF (disarm)    |
+| `T`   | status          |
 | `S`   | open screen relay |
 | `R`   | record          |
 | `P`   | ping            |
@@ -116,7 +141,7 @@ Browser keyboard shortcuts:
 
 | Module             | Flag      |
 |--------------------|-----------|
-| nhere v2.0         | ✓ clean   |
+| nhere v2.1         | ✓ clean   |
 | playintegrityfix   | ✓ clean   |
 | tricky_store       | ✓ clean   |
 | zygisksu           | ✓ clean   |
@@ -133,14 +158,17 @@ Legacy module `np3a_control` replaced by `nhere`. Old zip `n.zip` deleted.
 | Tool      | Available | Notes                                            |
 |-----------|-----------|--------------------------------------------------|
 | ifconfig  | yes       | no per-interface arg — use awk flag              |
-| pgrep     | yes       | used for sshd detection                          |
+| pgrep     | yes       | used as fallback for sshd detection (scoped `-u <user>`) |
 | dumpsys   | root only | wakelock via `su -c dumpsys power`               |
 | tailscale | bin only  | CLI cannot reach Android VPN daemon from Termux  |
-| ss/ip     | no        | not in this Termux install                       |
+| ss        | root shell| primary sshd detection (port-state); `netstat` is fallback |
 
 ## Deferred
 
 - `wakelock` real value — `su -c dumpsys power` path works in nhere now
-- Double-power-press plugin — optional Nothing-specific, not in core
+- Double-power-press plugin — **out of scope** for the Magisk module. Future
+  external wrappers (Button Mapper, Key Mapper, Quick Settings, Tasker) can
+  call `su -c 'nhere toggle'` from any rooted shell. No SystemUI patch, no
+  power-menu hook, no getevent watcher, no root daemon will be added here.
 - `rescue` mode — documented not wired
 - History scrub — real values in early commits (private repo, low urgency)

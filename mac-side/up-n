@@ -91,7 +91,7 @@ else
   cd "$REPO_ROOT"
   NHERE_HOST_IP="$NHERE_HOST_IP" NHERE_USER="$NHERE_USER" \
   NHERE_PORT="$NHERE_PORT" NHERE_KEY="$NHERE_KEY" nohup deno run \
-    --allow-net --allow-run --allow-read --allow-env \
+    --allow-net --allow-run --allow-read --allow-env --allow-write=/tmp/nhere-stream \
     mac-side/cockpit >/tmp/cockpit.log 2>&1 &
   disown 2>/dev/null || true
   for _ in $(seq 1 12); do

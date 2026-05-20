@@ -14,7 +14,7 @@
 **Phone (Nothing 3a Pro)**
 - Termux (F-Droid build)
 - Termux packages: `openssh` (required); `termux-api` (optional — enables wakelock via `nhere arm`)
-- Magisk + nhere v2.0 module installed
+- Magisk + nhere v2.1 module installed
 - Tailscale installed and logged in
 
 ---
@@ -49,15 +49,19 @@ Real `.conf` is gitignored. Never leaves your machine.
 
 ## 3. Termux clean-slate setup (after fresh install or reset)
 
+See **[docs/TERMUX_SETUP.md](docs/TERMUX_SETUP.md)** for the full safe procedure, including:
+- Soft cleanup (default — preserves sshd, authorized_keys, packages, Tailscale)
+- Verification commands (user, sshd binary, port, authorized_keys, tailscale, wake-lock, leftover checks)
+- Hard wipe (documentation-only — requires verified ADB/root/Magisk recovery first)
+- Post-cleanup reconnect checklist
+
+Quick path for a **fresh** Termux install with nothing to preserve:
+
 ```bash
 pkg update -y && pkg upgrade -y
 pkg install -y openssh
-
-# Set a password (needed to push the SSH key in step 4)
-passwd
-
-# Start sshd so you can push the key from Mac
-sshd
+passwd          # needed to push the SSH key in step 4
+sshd            # start so Mac can reach the phone
 ```
 
 Optional — wakelock support (`nhere arm` gracefully skips if absent):
@@ -71,13 +75,18 @@ Confirm your Termux user: `whoami` — use this value for `NHERE_USER` in your p
 
 ## 4. Install nhere Magisk module (once per device)
 
-```bash
-# On Mac — package the module
-cd ~/Desktop/nothinghere/phone-side/magisk-module
-zip -r ../../../nhere-v2.zip . -x "*.DS_Store"
+See **[docs/MAGISK_REBUILD.md](docs/MAGISK_REBUILD.md)** for the full rebuild and install checklist.
 
-# Push to phone
-adb push ../../../nhere-v2.zip /sdcard/Download/
+Quick path (from repo root on Mac):
+
+```bash
+# 1. Build
+bash build.sh                        # → nhere-v2.zip at repo root
+
+# 2. Push (ADB must be connected — run relay-prep first if needed)
+source profiles/nothing-3a-pro.conf
+adb connect "$NHERE_HOST_IP:5555"
+adb push nhere-v2.zip /sdcard/Download/
 ```
 
 On phone: Magisk → Modules → Install from storage → `nhere-v2.zip` → Reboot.
@@ -120,13 +129,10 @@ Or manually:
 # Arm phone
 ssh -i ~/.ssh/nhere_ed25519 -p 8022 USER@IP 'su -c "nhere arm"'
 
-# Start cockpit
+# Start cockpit — profile must use `export` (see profiles/*.example.conf)
 cd ~/Desktop/nothinghere
 source profiles/nothing-3a-pro.conf
-NHERE_HOST_IP="$NHERE_HOST_IP" NHERE_USER="$NHERE_USER" \
-NHERE_PORT="$NHERE_PORT" NHERE_KEY="$NHERE_KEY" deno run \
-  --allow-net --allow-run --allow-read --allow-env \
-  mac-side/cockpit &
+./mac-side/cockpit &
 
 open http://localhost:7779
 ```
@@ -164,7 +170,7 @@ NHERE_ADB_TCP=1
 | `state: DEGRADED`                | Check Tailscale on phone, run `nhere restart`    |
 | ADB not connecting               | Run `nhere relay-prep` first                     |
 | Cockpit shows DEAD but phone OK  | SSH directly, check `nhere status`, arm manually |
-| service.sh ran twice at boot     | Lock file `/data/adb/nhere/service.lock` prevents this — verify present |
+| service.sh ran twice at boot     | Boot-scoped lock `service.<boot_id>.lock` in `/data/adb/nhere/` prevents this |
 
 ---
 

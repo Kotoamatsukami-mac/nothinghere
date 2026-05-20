@@ -17,7 +17,7 @@ Termux provides the live userland services and tools. The Nothing Phone 3a Pro
 
 ---
 
-## Current state (v1 — confirmed working)
+## Current state (v2.1 — confirmed working)
 
 | Component | Status |
 |---|---|
@@ -26,7 +26,7 @@ Termux provides the live userland services and tools. The Nothing Phone 3a Pro
 | Cockpit :7779 | ✓ live — status, relay, record, screenshot, stream embed |
 | Screen relay (scrcpy) | ✓ native window via cockpit |
 | Embedded phone screen (HLS) | ✓ stream embed in cockpit right panel |
-| `up-n` alias + launcher | ✓ wired in ~/.zshrc, logic in mac-side/up |
+| `up-n` alias + launcher | ✓ wired in ~/.zshrc, logic in mac-side/up-n |
 | `wakelock` real value | ⏳ deferred |
 | `ctl restart / wake / sleep` | ⏳ deferred |
 | `rescue` mode | ⏳ deferred |
@@ -36,18 +36,20 @@ Termux provides the live userland services and tools. The Nothing Phone 3a Pro
 ## Quick start (current)
 
 ```bash
-# Start cockpit manually (before up-n is built)
+# Start cockpit manually
 cd ~/Desktop/nothinghere
 source profiles/nothing-3a-pro.conf
-nohup env NHERE_HOST_IP="$NHERE_HOST_IP" \
+nohup env NHERE_HOST_IP="$NHERE_HOST_IP" NHERE_USER="$NHERE_USER" \
+  NHERE_PORT="$NHERE_PORT" NHERE_KEY="$NHERE_KEY" \
   deno run --allow-net --allow-run --allow-read --allow-env \
+  --allow-write=/tmp/nhere-stream \
   mac-side/cockpit > /tmp/cockpit.log 2>&1 &
 open http://localhost:7779
 ```
 
-After `up-n` is built:
+One command (recommended):
 ```bash
-up-n   # one command — Tailscale + cockpit + screen + browser
+up-n   # Tailscale + cockpit + ADB + stream + browser
 ```
 
 ---
@@ -56,17 +58,21 @@ up-n   # one command — Tailscale + cockpit + screen + browser
 
 ```
 mac-side/
-  ctl          — SSH controller — ping, status
+  ctl          — SSH controller (ping, status, arm, disarm, …)
   cockpit      — Deno HTTP server :7779
-  up           — launcher script (⚙ in build)
+  up-n         — launcher: Tailscale + cockpit + stream + browser
 phone-side/
-  agent        — phone engine — ping, status
+  magisk-module/
+    system/bin/nhere — root command engine (arm/disarm/status/…)
+    service.sh       — boot service (one-shot arm restore, no daemon)
+    module.prop      — module identity
 profiles/
   nothing-3a-pro.conf         — gitignored, your real values
   nothing-3a-pro.example.conf — copy this, fill values
 docs/
   LIVE_ACCESS.md   — operator notes, confirmed state
-  OPUS_SCOPE.md    — active build scope for Opus
+  TERMUX_SETUP.md  — Termux reinstall and cleanup checklist
+build.sh     — packages phone-side/magisk-module → nhere-v2.zip
 DOCTRINE.md  — architecture doctrine (read before building)
 RUNBOOK.md   — setup steps
 ```
