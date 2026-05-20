@@ -78,7 +78,7 @@ case "$CMD" in
 
   status|arm|disarm|toggle|restart|relay-prep)
     TARGET="$(resolve_target)"
-    [ "$CMD" = "status" ] && printf '--- %s ---\n' "$PROFILE"
+    [ "$CMD" = "status" ] && printf -- '--- %s ---\n' "$PROFILE"
     ssh "${SSH_OPTS[@]}" "$NHERE_USER@$TARGET" "su -c 'nhere $CMD'"
     ;;
 
