@@ -512,7 +512,7 @@ async function streamStart(){
     try{const r=await fetch('/stream/stream.m3u8',{cache:'no-store'});if(r.ok){logCon(t+'\nmanifest ready');logErr('');applyStreamState(true);return;}}catch{}
     await new Promise(r=>setTimeout(r,300));
   }
-  logErr('stream process started but manifest not ready after ~7s. Check /tmp/cockpit.log, then press Start Stream again.');
+  logErr('stream process started but manifest not ready after ~7s. Check the terminal cockpit is running in (or /tmp/cockpit.log if launched detached), then press Start Stream again.');
 }
 async function streamStop(){logCon('/stream-stop...');const t=await fetchText('/stream-stop');if(t!==null)logCon(t);applyStreamState(false);}
 async function takeScreenshot(btn){

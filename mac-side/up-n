@@ -87,23 +87,30 @@ else
 fi
 
 # 5 — Cockpit
+# Foreground-attached pattern: cockpit launches as a child of *this* shell with
+# stdout/stderr going straight to the terminal. No nohup, no disown, no log
+# redirect — closing this terminal (or Ctrl-C below) kills cockpit, so it can
+# never silently stay live. up-n itself blocks on `wait` at the very end.
 printf "  %-12s " "[cockpit]"
+COCKPIT_PID=""        # set only if THIS run started cockpit (we don't kill someone else's)
 if curl -sf --max-time 2 "$COCKPIT_URL/status.json" >/dev/null 2>&1; then
-  ok "cockpit" "already running :7779"
+  warn "cockpit" "already running :7779 elsewhere — this terminal will NOT own it"
 else
   cd "$REPO_ROOT"
   NHERE_HOST_IP="$NHERE_HOST_IP" NHERE_USER="$NHERE_USER" \
-  NHERE_PORT="$NHERE_PORT" NHERE_KEY="$NHERE_KEY" nohup deno run \
+  NHERE_PORT="$NHERE_PORT" NHERE_KEY="$NHERE_KEY" \
+  NHERE_DEVICE_LABEL="${NHERE_DEVICE_LABEL:-}" \
+  deno run \
     --allow-net --allow-run --allow-read --allow-env --allow-write=/tmp/nhere-stream \
-    mac-side/cockpit >/tmp/cockpit.log 2>&1 &
-  disown 2>/dev/null || true
+    mac-side/cockpit &
+  COCKPIT_PID=$!
   for _ in $(seq 1 12); do
     sleep 1
     curl -sf --max-time 1 "$COCKPIT_URL/status.json" >/dev/null 2>&1 && break
   done
   curl -sf --max-time 2 "$COCKPIT_URL/status.json" >/dev/null 2>&1 \
-    && ok "cockpit" "started :7779" \
-    || warn "cockpit" "slow to start — check /tmp/cockpit.log"
+    && ok "cockpit" "started :7779 (pid $COCKPIT_PID — Ctrl-C here stops it)" \
+    || warn "cockpit" "slow to start — see output above"
 fi
 
 # 6 — Stream
@@ -125,4 +132,31 @@ fi
 
 # Final status
 STATE="$(curl -sf --max-time 3 "$COCKPIT_URL/status.json" 2>/dev/null | grep -o '"state":"[^"]*"' | cut -d'"' -f4 || echo unknown)"
-printf "\n${P}  ready${C}  cockpit=:7779  phone=${STATE}\n\n"
+printf "\n${P}  ready${C}  cockpit=:7779  phone=${STATE}\n"
+
+# ── Foreground attach ──────────────────────────────────────────────────────
+# If this run owns cockpit, block on it so the terminal stays bound to it.
+# Ctrl-C (SIGINT) or closing the terminal sends SIGTERM and we exit cleanly.
+# If cockpit was already running elsewhere we just exit — leaving the other
+# owner alone.
+if [ -n "$COCKPIT_PID" ]; then
+  printf "${P}  attached${C}  Ctrl-C here stops cockpit  (closing this terminal also stops it)\n\n"
+  cleanup() {
+    printf "\n  [up-n] stopping cockpit (pid %s)...\n" "$COCKPIT_PID"
+    kill "$COCKPIT_PID" 2>/dev/null || true
+    # Give deno a moment to drain, then escalate if needed.
+    for _ in 1 2 3 4 5; do
+      kill -0 "$COCKPIT_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -0 "$COCKPIT_PID" 2>/dev/null && kill -9 "$COCKPIT_PID" 2>/dev/null || true
+    exit 0
+  }
+  trap cleanup INT TERM HUP
+  # `wait` returns 128+signal under set -e — guard with || true so a clean
+  # Ctrl-C still gives a 0 exit code via the trap.
+  wait "$COCKPIT_PID" || true
+  printf "  [up-n] cockpit exited\n"
+else
+  printf "\n"
+fi
