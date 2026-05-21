@@ -1,27 +1,19 @@
 # controller
 
-Mac → Nothing 3a Pro remote control. That's it.
+Compact Nothing 3a Pro controller that launches two separate windows: a small Chrome app for the SSH utility panel and a normal scrcpy window for the phone screen.
 
-## what it does
-- left panel: live screen via scrcpy (ADB over Tailscale)
-- right panel: SSH terminal into phone
-- `hi phone` alias → drops you straight into a phone shell
+## Behaviour
 
-## requirements
-```
-brew install scrcpy
-pip3 install websockets
-```
-Phone needs: Termux + sshd running (handled by nn_core Magisk module).
+Running `python3 controller` starts the local web server on `http://localhost:7779`, opens Chrome in app mode, launches scrcpy separately, and auto-connects the SSH terminal.
 
-## run
-```bash
-./controller
-```
-Opens http://localhost:7779 automatically.
+## UI
 
-## alias
-Add to `~/.zshrc`:
+The web UI is a dark 400px-wide floating panel with a single top bar, live SSH status dot, `▶ screen` button, `⊡ shot` button, and a minimal terminal prompt that shows `hi phone ❯`.
+
+## Alias
+
+Use this in `~/.zshrc`:
+
 ```zsh
-alias 'hi phone'="ssh -i ~/.ssh/nhere_ed25519 -o StrictHostKeyChecking=accept-new -p 8022 u0_a296@100.99.93.102"
+alias hi\ phone='cd /Users/Aboogie/Desktop/nothinghere && python3 controller'
 ```

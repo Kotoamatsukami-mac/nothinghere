@@ -24,8 +24,6 @@ tmp/
 **/.DS_Store
 
 # ─── Recordings (cockpit captures) ────────────────────────────────────────────
-recordings/*
-!recordings/.gitkeep
 
 # ─── Build artifacts ──────────────────────────────────────────────────────────
 nhere*.zip
