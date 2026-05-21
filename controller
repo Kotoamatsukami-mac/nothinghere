@@ -166,6 +166,19 @@ button:active { transform: translateY(1px); }
   color: var(--text);
   padding: 0;
 }
+
+#controls {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border);
+  background: rgba(15,15,18,.98);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ctrl-row { display: flex; gap: 6px; justify-content: center; }
+.ctrl-btn { flex: 1; font-size: 11px; padding: 7px 4px; border-radius: 6px; text-align: center; }
+.ctrl-label { font-size: 9px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); padding: 0 2px 2px; }
 </style>
 </head>
 <body>
@@ -269,7 +282,42 @@ window.addEventListener('load', () => {
   connectSSH();
   cmd.focus();
 });
+
+function swipe(dir) {
+  const cmds = {
+    up:    'input swipe 540 1400 540 400 300',
+    down:  'input swipe 540 400 540 1400 300',
+    left:  'input swipe 900 760 100 760 300',
+    right: 'input swipe 100 760 900 760 300',
+  };
+  send({type: 'cmd', cmd: 'su -c "' + cmds[dir] + '"'});
+}
+function key(code) {
+  send({type: 'cmd', cmd: 'input keyevent ' + code});
+}
+
 </script>
+
+  <div id="controls">
+    <div class="ctrl-label">swipe</div>
+    <div class="ctrl-row">
+      <button class="ctrl-btn" onclick="swipe('up')">↑ up</button>
+    </div>
+    <div class="ctrl-row">
+      <button class="ctrl-btn" onclick="swipe('left')">← left</button>
+      <button class="ctrl-btn" onclick="swipe('down')">↓ down</button>
+      <button class="ctrl-btn" onclick="swipe('right')">→ right</button>
+    </div>
+    <div class="ctrl-label" style="margin-top:4px">buttons</div>
+    <div class="ctrl-row">
+      <button class="ctrl-btn" onclick="key('KEYCODE_VOLUME_UP')">vol +</button>
+      <button class="ctrl-btn" onclick="key('KEYCODE_VOLUME_DOWN')">vol −</button>
+      <button class="ctrl-btn" onclick="key('KEYCODE_POWER')">power</button>
+      <button class="ctrl-btn" onclick="key('KEYCODE_BACK')">back</button>
+      <button class="ctrl-btn" onclick="key('KEYCODE_HOME')">home</button>
+    </div>
+  </div>
+
 </body>
 </html>
 '''
@@ -369,7 +417,7 @@ def open_chrome_app():
         [
             "open",
             "-na",
-            "Google Chrome",
+            "Brave Browser",
             "--args",
             f"--app={APP_URL}",
         ],
