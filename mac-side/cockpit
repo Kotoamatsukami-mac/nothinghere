@@ -44,12 +44,19 @@ function killPid(pid: number | null): void {
 
 async function run(cmd: string[], timeoutMs?: number): Promise<{ ok: boolean; out: string }> {
   try {
-    const opts: Deno.CommandOptions = { args: cmd.slice(1), stdout: "piped", stderr: "piped" };
-    // Timeout protection: aborting the signal kills the child process.
-    if (timeoutMs) opts.signal = AbortSignal.timeout(timeoutMs);
-    const p = new Deno.Command(cmd[0], opts);
+    const p = new Deno.Command(cmd[0], { args: cmd.slice(1), stdout: "piped", stderr: "piped" }).spawn();
+    // Timeout protection. AbortSignal alone does NOT work for adb — it ignores
+    // SIGTERM while blocked in connect() and rides out the OS TCP timeout (~75s
+    // on macOS). Force-kill with SIGKILL instead, which adb cannot ignore.
+    let killed = false;
+    let timer: number | null = null;
+    if (timeoutMs) {
+      timer = setTimeout(() => { killed = true; try { p.kill("SIGKILL"); } catch { /* already dead */ } }, timeoutMs);
+    }
     const { success, stdout, stderr } = await p.output();
-    return { ok: success, out: (new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr)).trim() };
+    if (timer !== null) clearTimeout(timer);
+    const out = (new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr)).trim();
+    return { ok: success && !killed, out: killed ? `timeout after ${timeoutMs}ms\n${out}` : out };
   } catch (e) { return { ok: false, out: String(e) }; }
 }
 
@@ -109,6 +116,73 @@ async function latestFile(dir: string, exts: string[]): Promise<FileInfo | null>
     }
   } catch { /* dir missing — normal before first capture */ }
   return best;
+}
+
+// ── adb device picker ──────────────────────────────────────────────────────
+// Returns the serial of a usable adb device, or null if none reachable.
+// Strategy:
+//   1. Scan `adb devices`. Prefer the configured Tailscale TCP serial when
+//      it's reporting "device" (handshake complete). Otherwise take the first
+//      plain-USB serial.
+//   2. Nothing usable? If TCP is stuck in "offline", `adb disconnect` then
+//      `adb connect` to clear the stale handshake (necessary because raw
+//      `adb connect` against an offline entry just hangs).
+//   3. Still nothing? Bootstrap the phone's adbd TCP listener over SSH via
+//      `nhere relay-prep`, wait for it to come up, retry the connect.
+// Bounded throughout — never hangs longer than ~12 s in the worst case.
+async function pickAdbDevice(): Promise<{ serial: string | null; reason?: string }> {
+  const scan = async (): Promise<{ tcp: string | null; usb: string | null; offlineTcp: boolean }> => {
+    const r = await run(["adb", "devices"], 2500);
+    let tcp: string | null = null, usb: string | null = null, offlineTcp = false;
+    if (!r.ok) return { tcp, usb, offlineTcp };
+    for (const line of r.out.split("\n").slice(1)) { // skip header
+      const m = line.match(/^(\S+)\s+(device|offline|unauthorized)/);
+      if (!m) continue;
+      const [, sn, state] = m;
+      if (sn === ADB_SERIAL) {
+        if (state === "device") tcp = sn;
+        else if (state === "offline") offlineTcp = true;
+      } else if (!sn.includes(":") && state === "device" && !usb) {
+        usb = sn;
+      }
+    }
+    return { tcp, usb, offlineTcp };
+  };
+
+  // Step 1: fast path — already-good device. Common case, returns in <1s.
+  let s = await scan();
+  if (s.tcp) return { serial: s.tcp };
+  if (s.usb) return { serial: s.usb };
+
+  // Step 2: local reconnect. Handles the stale-handshake case where TCP shows
+  // "offline" even though the phone is actually reachable.
+  if (s.offlineTcp) await run(["adb", "disconnect", ADB_SERIAL], 2000);
+  await run(["adb", "connect", ADB_SERIAL], 3000);
+  s = await scan();
+  if (s.tcp) return { serial: s.tcp };
+  if (s.usb) return { serial: s.usb };
+
+  // Step 3: phone-side bootstrap via SSH. nhere relay-prep enables adbd TCP
+  // on port 5555 on the phone. Only worth trying if SSH itself is reachable —
+  // if the phone is asleep or off-Tailscale, this just adds latency, so the
+  // SSH call uses a short ConnectTimeout via nhereOverSsh (4s) AND we cap
+  // total relay-prep time. After it returns, give adbd a beat then reconnect.
+  const relay = await nhereOverSsh("relay-prep");
+  if (relay.ok) {
+    await new Promise((r) => setTimeout(r, 2000));
+    await run(["adb", "disconnect", ADB_SERIAL], 2000);
+    await run(["adb", "connect", ADB_SERIAL], 3000);
+    s = await scan();
+    if (s.tcp) return { serial: s.tcp };
+    if (s.usb) return { serial: s.usb };
+  }
+
+  return {
+    serial: null,
+    reason: relay.ok
+      ? `relay-prep succeeded but adb still cannot reach ${ADB_SERIAL}; check phone`
+      : `no adb device reachable. SSH to phone also failed (${relay.out.split("\n")[0] || "timeout"}). Phone may be asleep or off Tailscale.`,
+  };
 }
 
 // ── nhere control plane ──────────────────────────────────────────────────────
@@ -644,12 +718,15 @@ async function handler(req: Request): Promise<Response> {
     if (!(await scrcpyInstalled())) {
       return new Response("scrcpy not installed\n  install: brew install scrcpy", {status:500, headers:{"Content-Type":"text/plain"}});
     }
-    await run(["adb","connect",ADB_SERIAL]);
+    const pick = await pickAdbDevice();
+    if (!pick.serial) {
+      return new Response(`adb unavailable: ${pick.reason}`, {status:503, headers:{"Content-Type":"text/plain"}});
+    }
     // Spawn detached so scrcpy does NOT block the cockpit server.
-    const p=new Deno.Command("scrcpy",{args:["-s",ADB_SERIAL,"--stay-awake","--window-title","Nothing Live","--max-size","1280","--video-bit-rate","8M"],stdout:"null",stderr:"null",stdin:"null"}).spawn();
+    const p=new Deno.Command("scrcpy",{args:["-s",pick.serial,"--stay-awake","--window-title","Nothing Live","--max-size","1280","--video-bit-rate","8M"],stdout:"null",stderr:"null",stdin:"null"}).spawn();
     relayPid=p.pid;
     p.status.then(()=>{relayPid=null;}).catch(()=>{relayPid=null;});
-    return new Response(`ok pid=${relayPid}`,{headers:{"Content-Type":"text/plain"}});
+    return new Response(`ok pid=${relayPid} (device=${pick.serial})`,{headers:{"Content-Type":"text/plain"}});
   }
   if (path==="/close-screen") { killPid(relayPid); relayPid=null; return new Response("closed",{headers:{"Content-Type":"text/plain"}}); }
   if (path==="/record") {
@@ -657,20 +734,22 @@ async function handler(req: Request): Promise<Response> {
     if (!(await scrcpyInstalled())) {
       return new Response("scrcpy not installed\n  install: brew install scrcpy", {status:500, headers:{"Content-Type":"text/plain"}});
     }
-    await run(["adb","connect",ADB_SERIAL]);
+    const pick=await pickAdbDevice();
+    if (!pick.serial) return new Response(`adb unavailable: ${pick.reason}`,{status:503,headers:{"Content-Type":"text/plain"}});
     const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
     const out=`${RECORDINGS_DIR}/rec-${ts}.mp4`;
-    const p=new Deno.Command("scrcpy",{args:["-s",ADB_SERIAL,"--no-display","--record",out],stdout:"null",stderr:"null",stdin:"null"}).spawn();
+    const p=new Deno.Command("scrcpy",{args:["-s",pick.serial,"--no-display","--record",out],stdout:"null",stderr:"null",stdin:"null"}).spawn();
     recordingPid=p.pid;
     p.status.then(()=>{recordingPid=null;}).catch(()=>{recordingPid=null;});
-    return new Response(`ok ${out}`,{headers:{"Content-Type":"text/plain"}});
+    return new Response(`ok ${out} (device=${pick.serial})`,{headers:{"Content-Type":"text/plain"}});
   }
   if (path==="/stop-record") { killPid(recordingPid); recordingPid=null; return new Response("stopped",{headers:{"Content-Type":"text/plain"}}); }
   if (path==="/screenshot") {
-    await run(["adb","connect",ADB_SERIAL]);
+    const pick=await pickAdbDevice();
+    if (!pick.serial) return new Response(`adb unavailable: ${pick.reason}`,{status:503,headers:{"Content-Type":"text/plain"}});
     const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
     const out=`${RECORDINGS_DIR}/shot-${ts}.png`;
-    const p=new Deno.Command("bash",{args:["-c",`adb -s ${ADB_SERIAL} exec-out screencap -p > "${out}"`],stdout:"null",stderr:"null"});
+    const p=new Deno.Command("bash",{args:["-c",`adb -s ${shq(pick.serial)} exec-out screencap -p > ${shq(out)}`],stdout:"null",stderr:"null"});
     const {success}=await p.output();
     return new Response(success?`ok ${out}`:"failed",{headers:{"Content-Type":"text/plain"}});
   }
@@ -679,22 +758,25 @@ async function handler(req: Request): Promise<Response> {
   if (path==="/pull-recordings") {
     const dir=`${CAPTURES_DIR}/Movies`;
     await run(["mkdir","-p",dir]);
-    await run(["adb","connect",ADB_SERIAL]);
-    const r=await run(["adb","-s",ADB_SERIAL,"pull","/sdcard/Movies/",dir+"/"]);
+    const pick=await pickAdbDevice();
+    if (!pick.serial) return new Response(`adb unavailable: ${pick.reason}`,{status:503,headers:{"Content-Type":"text/plain"}});
+    const r=await run(["adb","-s",pick.serial,"pull","/sdcard/Movies/",dir+"/"]);
     return new Response(r.ok?`pulled → ${dir}\n${r.out}`:`pull failed\n${r.out}`,{status:r.ok?200:500,headers:{"Content-Type":"text/plain"}});
   }
   if (path==="/pull-screenshots") {
     const dir=`${CAPTURES_DIR}/Screenshots`;
     await run(["mkdir","-p",dir]);
-    await run(["adb","connect",ADB_SERIAL]);
-    const r=await run(["adb","-s",ADB_SERIAL,"pull","/sdcard/Pictures/Screenshots/",dir+"/"]);
+    const pick=await pickAdbDevice();
+    if (!pick.serial) return new Response(`adb unavailable: ${pick.reason}`,{status:503,headers:{"Content-Type":"text/plain"}});
+    const r=await run(["adb","-s",pick.serial,"pull","/sdcard/Pictures/Screenshots/",dir+"/"]);
     return new Response(r.ok?`pulled → ${dir}\n${r.out}`:`pull failed\n${r.out}`,{status:r.ok?200:500,headers:{"Content-Type":"text/plain"}});
   }
   if (path==="/pull-downloads") {
     const dir=`${CAPTURES_DIR}/Download`;
     await run(["mkdir","-p",dir]);
-    await run(["adb","connect",ADB_SERIAL]);
-    const r=await run(["adb","-s",ADB_SERIAL,"pull","/sdcard/Download/",dir+"/"]);
+    const pick=await pickAdbDevice();
+    if (!pick.serial) return new Response(`adb unavailable: ${pick.reason}`,{status:503,headers:{"Content-Type":"text/plain"}});
+    const r=await run(["adb","-s",pick.serial,"pull","/sdcard/Download/",dir+"/"]);
     return new Response(r.ok?`pulled → ${dir}\n${r.out}`:`pull failed\n${r.out}`,{status:r.ok?200:500,headers:{"Content-Type":"text/plain"}});
   }
   if (path==="/open-captures") {
@@ -719,10 +801,9 @@ async function handler(req: Request): Promise<Response> {
       recorder: isPidAlive(recordingPid),
       captures_dir: CAPTURES_DIR,
     });
-    await run(["adb","connect",ADB_SERIAL],8000);
-    const chk=await run(["adb","-s",ADB_SERIAL,"get-state"],8000);
-    if (!chk.ok || chk.out.trim()!=="device") {
-      return jsonResponse({ok:false,message:"adb device not connected",error:chk.out||"no device",state:macState()},503);
+    const pick=await pickAdbDevice();
+    if (!pick.serial) {
+      return jsonResponse({ok:false,message:"adb device not connected",error:pick.reason,state:macState()},503);
     }
     const dir=`${CAPTURES_DIR}/Screenshots`;
     await run(["mkdir","-p",dir]);
@@ -731,7 +812,7 @@ async function handler(req: Request): Promise<Response> {
     const stamp=`${d.getFullYear()}${p2(d.getMonth()+1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
     const name=`screenshot_${stamp}.png`;
     const out=`${dir}/${name}`;
-    const cap=await run(["bash","-c",`adb -s ${shq(ADB_SERIAL)} exec-out screencap -p > ${shq(out)}`],15000);
+    const cap=await run(["bash","-c",`adb -s ${shq(pick.serial)} exec-out screencap -p > ${shq(out)}`],15000);
     let size=0;
     try { size=(await Deno.stat(out)).size; } catch { /* not written */ }
     // Verify a full PNG: 8-byte signature at the start AND the 8-byte IEND
