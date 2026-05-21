@@ -113,6 +113,7 @@ Routes:
 | `/record`       | scrcpy --no-display --record → recordings/    |
 | `/stop-record`  | SIGTERM recording                             |
 | `/screenshot`   | adb screencap → recordings/shot-TIMESTAMP.png |
+| `/take-screenshot` | adb exec-out screencap → ~/Desktop/NothingCaptures/Screenshots/screenshot_TIMESTAMP.png; returns JSON `{ ok, message, file, url, state }` |
 | `/stream-start` | start HLS stream                              |
 | `/stream-stop`  | stop stream, clean segments                   |
 | `/stream.json`  | `{ alive: bool, pid: number }`                |
@@ -121,6 +122,8 @@ Routes:
 | `/pull-screenshots`| adb pull /sdcard/Pictures/Screenshots/ → ~/Desktop/NothingCaptures/Screenshots |
 | `/pull-downloads`  | adb pull /sdcard/Download/ → ~/Desktop/NothingCaptures/Download |
 | `/open-captures`   | open ~/Desktop/NothingCaptures in Finder      |
+| `/open-screenshots`| open ~/Desktop/NothingCaptures/Screenshots in Finder |
+| `/captures/*`      | read-only static serving of files under ~/Desktop/NothingCaptures (traversal-blocked, HTTP Range supported) |
 
 Cockpit visual states:
 - **LIVE** — `state=armed`. Neon green sweep bar, ambient glow, green badge.
@@ -130,6 +133,33 @@ Cockpit visual states:
 Sidebar sections: **live control** (State, Screen, Stream, Refresh/Ping) →
 **capture + pull** (Record, Files) → **device status** (inline state badges
 for screen/stream/recorder).
+
+### Right preview rail
+
+The layout is a 3-column grid: left controls/sidebar → centre live stream →
+right preview rail. The rail holds three bordered cards:
+
+- **Phone Screen Preview** — phone-framed device card. Mirrors the HLS stream
+  in a small framed `<video>`. Frame border is neon green when the stream is
+  live, muted zinc when offline. Top-right badge shows LIVE / OFFLINE /
+  UNKNOWN. *Open Screen Window* launches native scrcpy via `/open-screen`
+  (scrcpy is never embedded in the browser). Shows a clean `Stream offline`
+  placeholder when no stream is running.
+- **Recording Preview** — shows the latest file in
+  `~/Desktop/NothingCaptures/Movies` (populated by `/pull-recordings`):
+  filename, timestamp, size, and idle/recording status. Browser-playable
+  files (mp4/webm/mov) render an inline `<video>`; otherwise it shows
+  `No recording loaded yet`.
+- **Screenshot Preview** — *Take Screenshot* calls `/take-screenshot`, which
+  runs `adb exec-out screencap -p` straight to the Mac capture folder and
+  returns JSON. On success the card's image updates immediately (cache-busted
+  URL) with no page reload, and the JSON result is echoed to the Console
+  debug panel. *Open Screenshot Folder* opens the Screenshots folder. On page
+  load the card shows the most recent screenshot if one exists.
+
+The stream LIVE/OFFLINE state is polled every 2s via the cheap `/stream.json`
+pid check, which keeps the rail badges and mirrored video honest without a
+heavy SSH round trip.
 
 Browser keyboard shortcuts:
 | Key   | Action          |

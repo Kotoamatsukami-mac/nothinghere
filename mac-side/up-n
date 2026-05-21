@@ -6,7 +6,10 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-source "$REPO_ROOT/profiles/nothing-3a-pro.conf" 2>/dev/null || { echo "profile missing"; exit 1; }
+# Profile-pluggable: any Android with a profiles/<name>.conf can be driven by
+# setting NHERE_PROFILE=<name>. Default preserves existing behaviour.
+PROFILE="${NHERE_PROFILE:-nothing-3a-pro}"
+source "$REPO_ROOT/profiles/${PROFILE}.conf" 2>/dev/null || { echo "profile missing: profiles/${PROFILE}.conf"; exit 1; }
 
 COCKPIT_URL="http://localhost:7779"
 ADB_SERIAL="${NHERE_HOST_IP}:5555"
