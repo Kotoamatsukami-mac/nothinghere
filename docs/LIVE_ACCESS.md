@@ -108,7 +108,7 @@ Routes:
 | `/`             | cockpit UI — LIVE/DEAD/DEGRADED state visual  |
 | `/status.json`  | structured JSON                               |
 | `/ping`         | SSH reachability check                        |
-| `/open-screen`  | scrcpy native window launch                   |
+| `/open-screen`  | scrcpy launch (--stay-awake --max-size 1280 --video-bit-rate 8M) |
 | `/close-screen` | SIGTERM relay                                 |
 | `/record`       | scrcpy --no-display --record → recordings/    |
 | `/stop-record`  | SIGTERM recording                             |
@@ -117,11 +117,19 @@ Routes:
 | `/stream-stop`  | stop stream, clean segments                   |
 | `/stream.json`  | `{ alive: bool, pid: number }`                |
 | `/stream/*`     | serve HLS segments                            |
+| `/pull-recordings` | adb pull /sdcard/Movies/ → ~/Desktop/NothingCaptures/Movies |
+| `/pull-screenshots`| adb pull /sdcard/Pictures/Screenshots/ → ~/Desktop/NothingCaptures/Screenshots |
+| `/pull-downloads`  | adb pull /sdcard/Download/ → ~/Desktop/NothingCaptures/Download |
+| `/open-captures`   | open ~/Desktop/NothingCaptures in Finder      |
 
 Cockpit visual states:
-- **LIVE** — `state=armed`. Yellow lightning bar, glow badge, bolt SVG overlay.
-- **OFF** — `state=disarmed`. Dim, frozen.
-- **UNKNOWN** — unreachable or any other value. Amber.
+- **LIVE** — `state=armed`. Neon green sweep bar, ambient glow, green badge.
+- **OFF** — `state=disarmed`. Dim bar, muted badge.
+- **UNKNOWN** — unreachable or any other value. Amber/orange.
+
+Sidebar sections: **live control** (State, Screen, Stream, Refresh/Ping) →
+**capture + pull** (Record, Files) → **device status** (inline state badges
+for screen/stream/recorder).
 
 Browser keyboard shortcuts:
 | Key   | Action          |
