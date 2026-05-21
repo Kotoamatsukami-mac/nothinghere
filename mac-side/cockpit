@@ -323,16 +323,22 @@ main{display:grid;grid-template-columns:264px 1fr;gap:0;flex:1;overflow:hidden}
 .sa{display:flex;gap:4px}
 .vw{flex:1;display:flex;align-items:center;justify-content:center;position:relative;min-height:0;background:#050505}
 video{max-width:100%;max-height:100%;display:block;object-fit:contain}
-.off{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);font-size:12px;position:absolute;inset:0;pointer-events:none}
-.off svg{opacity:.15}.off span{opacity:.35;font-size:10px}
+/* Streaming-offline overlay — scoped to .vw so the bare ".off" class on
+   preview cards / badges / frames / buttons doesn't accidentally inherit
+   position:absolute and stretch over the whole strip. */
+.vw > .off{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);font-size:12px;position:absolute;inset:0;pointer-events:none}
+.vw > .off svg{opacity:.15}.vw > .off span{opacity:.35;font-size:10px}
 .fsb{position:absolute;bottom:10px;right:10px;background:rgba(255,255,255,.03);border:1px solid var(--border);color:var(--muted);border-radius:3px;padding:4px 8px;font-size:9px;font-family:var(--f);cursor:pointer;transition:all .1s;z-index:10;letter-spacing:.04em}
 .fsb:hover{border-color:var(--muted);color:var(--text)}
 ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 
 /* ── preview strip (under the stream pane) ── */
-.strip{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:10px;border-top:1px solid var(--border);background:var(--surface);flex-shrink:0}
+/* Plain flex row, explicit flex:1 1 0 per card so all three share the row
+   equally regardless of content. Grid layout was getting overridden somewhere
+   in the cascade — flex is simpler and more predictable here. */
+.strip{display:flex;flex-direction:row;gap:8px;padding:10px;border-top:1px solid var(--border);background:var(--surface);flex-shrink:0;align-items:stretch}
 .state-live .strip{border-top-color:rgba(0,255,65,.12)}
-.strip .card{display:flex;flex-direction:column;min-width:0}
+.strip > .card{flex:1 1 0;min-width:0;display:flex;flex-direction:column}
 .pcard.live{border-color:rgba(0,255,65,.2)}
 .pcard.unknown{border-color:rgba(249,115,22,.2)}
 .rhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:8px}
