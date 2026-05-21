@@ -1,254 +1,306 @@
 #!/usr/bin/env python3
 """
-controller — compact floating utility panel + separate scrcpy window
+controller — cockpit panel under scrcpy
 """
 
 import asyncio
-import base64
-import hashlib
 import http.server
 import json
 import os
 import socketserver
 import subprocess
 import threading
+import time
 from http import HTTPStatus
+
+import websockets
+from websockets.server import WebSocketServerProtocol
 
 PHONE_IP = "100.99.93.102"
 PHONE_PORT = "8022"
 PHONE_USER = "u0_a296"
 SSH_KEY = os.path.expanduser("~/.ssh/nhere_ed25519")
-ADB_SERIAL = f"{PHONE_IP}:5555"
+ADB_SERIAL = "100.99.93.102:5555"
 HTTP_PORT = 7779
 WS_PORT = 7780
 APP_URL = f"http://localhost:{HTTP_PORT}"
+SCRCPY_CMD = [
+    "scrcpy",
+    "-s",
+    ADB_SERIAL,
+    "--stay-awake",
+    "--video-encoder=c2.android.avc.encoder",
+    "--max-size=430",
+    "--window-x=0",
+    "--window-y=0",
+    "--window-borderless",
+]
+BRAVE_CMD = [
+    "open",
+    "-na",
+    "Brave Browser",
+    "--args",
+    f"--app={APP_URL}",
+    "--window-size=430,400",
+    "--window-position=0,954",
+]
+SSH_CMD = [
+    "ssh",
+    "-i",
+    SSH_KEY,
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "ServerAliveInterval=30",
+    "-p",
+    PHONE_PORT,
+    f"{PHONE_USER}@{PHONE_IP}",
+]
 
 HTML = r'''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=430, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>controller</title>
 <style>
 :root {
-  --bg: #0a0a0c;
-  --surface: #0f0f12;
-  --surface-2: #131317;
-  --border: #1c1c20;
-  --accent: #00ff88;
-  --text: #f3f5f4;
-  --muted: #8c8f98;
-  --danger: #ff6b81;
-  --mono: "SF Mono", "JetBrains Mono", "Fira Code", monospace;
+  --bg: #09090b;
+  --panel: #0d0d10;
+  --panel-2: #0b0b0d;
+  --border: #18181d;
+  --accent: #00ff41;
+  --text: #9affb6;
+  --muted: #4f8c5d;
+  --danger: #ff646e;
+  --mono: "SF Mono", "JetBrains Mono", "Menlo", monospace;
 }
 * { box-sizing: border-box; }
 html, body {
   margin: 0;
-  width: 400px;
-  min-width: 400px;
-  max-width: 400px;
-  min-height: 100%;
+  width: 430px;
+  min-width: 430px;
+  max-width: 430px;
+  height: 400px;
+  min-height: 400px;
+  max-height: 400px;
+  overflow: hidden;
   background: var(--bg);
   color: var(--text);
-  font: 13px/1.45 var(--mono);
-  overflow: hidden;
+  font: 13px/1.35 var(--mono);
 }
 body {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: 40px 230px 44px 86px;
   border-left: 1px solid var(--border);
+  border-right: 1px solid #101014;
 }
 button, input { font: inherit; }
 button {
   appearance: none;
   border: 1px solid var(--border);
-  background: transparent;
-  color: var(--muted);
-  border-radius: 8px;
-  padding: 6px 10px;
-  cursor: pointer;
-  transition: border-color .12s ease, color .12s ease, background .12s ease;
-}
-button:hover {
-  border-color: rgba(0,255,136,.35);
-  color: var(--accent);
-  background: rgba(0,255,136,.05);
-}
-button:active { transform: translateY(1px); }
-#topbar {
-  height: 44px;
-  padding: 0 10px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  border-bottom: 1px solid var(--border);
-  background: rgba(10,10,12,.96);
-  flex: 0 0 auto;
-}
-#brand {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  background: linear-gradient(180deg, rgba(0,255,65,.03), rgba(0,0,0,0));
   color: var(--text);
-  letter-spacing: .02em;
+  padding: 0 10px;
+  margin: 0;
+  border-radius: 0;
+  cursor: pointer;
 }
-#brand strong {
+button:hover { border-color: #214927; background: rgba(0,255,65,.05); }
+button:active { background: rgba(0,255,65,.1); }
+#header {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  background: #08080a;
+}
+#title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  white-space: nowrap;
+}
+#title strong {
   font-size: 12px;
   font-weight: 600;
+  letter-spacing: .08em;
+  color: var(--text);
 }
 #status-dot {
   width: 8px;
   height: 8px;
   border-radius: 999px;
-  background: #2d3138;
-  box-shadow: 0 0 0 1px rgba(255,255,255,.03);
-  flex: 0 0 auto;
+  background: #19301f;
+  box-shadow: 0 0 0 1px #132116;
 }
 #status-dot.live {
   background: var(--accent);
-  box-shadow: 0 0 10px rgba(0,255,136,.6);
+  box-shadow: 0 0 8px rgba(0,255,65,.85);
 }
-.spacer { flex: 1; }
-.action {
-  min-width: 0;
+.head-btn {
+  height: 24px;
   font-size: 12px;
-  padding-inline: 9px;
+  min-width: 42px;
 }
-#terminal-wrap {
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%);
-}
-#term {
-  flex: 1 1 auto;
-  min-height: 0;
+#terminal {
+  background: var(--panel-2);
   overflow-y: auto;
-  padding: 12px 12px 10px;
-  scrollbar-width: thin;
-  scrollbar-color: #23262c transparent;
-}
-#term::-webkit-scrollbar { width: 6px; }
-#term::-webkit-scrollbar-thumb {
-  background: #23262c;
-  border-radius: 999px;
-}
-.line {
+  padding: 8px 10px;
   white-space: pre-wrap;
   word-break: break-word;
+  border-bottom: 1px solid var(--border);
+  scrollbar-width: thin;
+  scrollbar-color: #13331a #09090b;
 }
-.out { color: #d8dbe4; }
+#terminal::-webkit-scrollbar { width: 6px; }
+#terminal::-webkit-scrollbar-track { background: #09090b; }
+#terminal::-webkit-scrollbar-thumb { background: #13331a; }
+.line { margin: 0 0 2px; }
+.out { color: var(--text); }
 .err { color: var(--danger); }
 .info { color: var(--muted); }
 .ok { color: var(--accent); }
-#prompt-row {
-  display: flex;
+#promptbar {
+  display: grid;
+  grid-template-columns: auto 1fr;
   align-items: center;
   gap: 8px;
-  padding: 10px 12px 12px;
-  border-top: 1px solid var(--border);
-  background: rgba(15,15,18,.98);
-  flex: 0 0 auto;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  background: #0a0a0c;
 }
 #prompt {
-  color: var(--accent);
-  font-size: 12px;
   white-space: nowrap;
+  color: var(--accent);
 }
 #cmd {
-  flex: 1;
-  min-width: 0;
+  width: 100%;
   border: 0;
   outline: 0;
   background: transparent;
   color: var(--text);
   padding: 0;
 }
-
 #controls {
-  flex: 0 0 auto;
-  border-top: 1px solid var(--border);
-  background: rgba(15,15,18,.98);
-  padding: 10px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: 132px 1fr;
+  background: #08080a;
 }
-.ctrl-row { display: flex; gap: 6px; justify-content: center; }
-.ctrl-btn { flex: 1; font-size: 11px; padding: 7px 4px; border-radius: 6px; text-align: center; }
-.ctrl-label { font-size: 9px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); padding: 0 2px 2px; }
+#dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(2, 1fr);
+  gap: 1px;
+  padding: 1px 1px 1px 0;
+  border-right: 1px solid var(--border);
+}
+#system {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(2, 1fr);
+  gap: 1px;
+  padding: 1px 0 1px 1px;
+}
+.ctrl {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  font-size: 12px;
+}
+.empty {
+  border: 0;
+  background: transparent;
+  cursor: default;
+}
 </style>
 </head>
 <body>
-  <div id="topbar">
-    <div id="brand">
-      <strong>⬡ controller</strong>
-      <span id="status-dot"></span>
-    </div>
-    <div class="spacer"></div>
-    <button class="action" id="screen-btn">▶ screen</button>
-    <button class="action" id="shot-btn">⊡ shot</button>
+  <div id="header">
+    <div id="title"><strong>⬡ controller</strong><span id="status-dot"></span></div>
+    <button class="head-btn" id="screen">▶ screen</button>
+    <button class="head-btn" id="shot">⊡</button>
+    <div></div>
   </div>
 
-  <div id="terminal-wrap">
-    <div id="term" aria-live="polite"></div>
-    <div id="prompt-row">
-      <div id="prompt">hi phone ❯</div>
-      <input id="cmd" type="text" autocomplete="off" spellcheck="false" autofocus />
+  <div id="terminal" aria-live="polite"></div>
+
+  <div id="promptbar">
+    <div id="prompt">hi phone ❯</div>
+    <input id="cmd" type="text" autocomplete="off" spellcheck="false" autofocus>
+  </div>
+
+  <div id="controls">
+    <div id="dpad">
+      <button class="ctrl empty" tabindex="-1"></button>
+      <button class="ctrl" data-action="up">↑</button>
+      <button class="ctrl empty" tabindex="-1"></button>
+      <button class="ctrl" data-action="left">←</button>
+      <button class="ctrl" data-action="down">↓</button>
+      <button class="ctrl" data-action="right">→</button>
+    </div>
+    <div id="system">
+      <button class="ctrl" data-action="volup">vol+</button>
+      <button class="ctrl" data-action="voldown">vol−</button>
+      <button class="ctrl" data-action="power">power</button>
+      <button class="ctrl" data-action="back">back</button>
+      <button class="ctrl" data-action="home">home</button>
+      <button class="ctrl empty" tabindex="-1"></button>
     </div>
   </div>
 
 <script>
-const term = document.getElementById('term');
-const cmd = document.getElementById('cmd');
-const statusDot = document.getElementById('status-dot');
-const screenBtn = document.getElementById('screen-btn');
-const shotBtn = document.getElementById('shot-btn');
+const terminalEl = document.getElementById('terminal');
+const cmdEl = document.getElementById('cmd');
+const dotEl = document.getElementById('status-dot');
+const screenBtn = document.getElementById('screen');
+const shotBtn = document.getElementById('shot');
+const controls = document.querySelectorAll('[data-action]');
 let ws = null;
-let pending = [];
-let connected = false;
+let reconnectDelay = 5000;
+let reconnectTimer = null;
+let intentionalClose = false;
 
 function appendLine(text, cls = 'out') {
-  const el = document.createElement('div');
-  el.className = `line ${cls}`;
-  el.textContent = text;
-  term.appendChild(el);
-  term.scrollTop = term.scrollHeight;
+  const line = document.createElement('div');
+  line.className = `line ${cls}`;
+  line.textContent = text;
+  terminalEl.appendChild(line);
+  terminalEl.scrollTop = terminalEl.scrollHeight;
 }
 
-function flushQueue() {
-  if (!connected || !ws) return;
-  while (pending.length) {
-    ws.send(pending.shift());
-  }
-}
-
-function updateStatus(state) {
-  connected = state;
-  statusDot.classList.toggle('live', state);
+function setLive(live) {
+  dotEl.classList.toggle('live', live);
 }
 
 function send(payload) {
-  const message = JSON.stringify(payload);
-  if (connected && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(message);
-  } else {
-    pending.push(message);
-  }
-}
-
-function connectSSH() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    appendLine('offline', 'err');
     return;
   }
+  ws.send(JSON.stringify(payload));
+}
+
+function scheduleReconnect() {
+  if (intentionalClose || reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, reconnectDelay);
+}
+
+function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   appendLine('connecting…', 'info');
-  ws = new WebSocket(`ws://${location.hostname}:${location.port == '7779' ? '7780' : location.port}`.replace(':7779', ':7780'));
+  ws = new WebSocket('ws://127.0.0.1:7780');
   ws.onopen = () => {
-    updateStatus(true);
+    setLive(true);
     appendLine('ssh connected', 'ok');
-    flushQueue();
   };
   ws.onmessage = (event) => {
     try {
@@ -258,120 +310,53 @@ function connectSSH() {
       appendLine(String(event.data || ''), 'out');
     }
   };
-  ws.onerror = () => appendLine('connection error', 'err');
+  ws.onerror = () => appendLine('ws error', 'err');
   ws.onclose = () => {
-    const wasConnected = connected;
-    updateStatus(false);
+    setLive(false);
     ws = null;
-    if (wasConnected) appendLine('ssh disconnected', 'info');
-    setTimeout(connectSSH, 1200);
+    appendLine('ssh disconnected', 'info');
+    scheduleReconnect();
   };
 }
 
 screenBtn.addEventListener('click', () => send({type: 'screen'}));
 shotBtn.addEventListener('click', () => send({type: 'screenshot'}));
-cmd.addEventListener('keydown', (event) => {
+controls.forEach((btn) => {
+  btn.addEventListener('click', () => send({type: 'action', action: btn.dataset.action}));
+});
+cmdEl.addEventListener('keydown', (event) => {
   if (event.key !== 'Enter') return;
-  const value = cmd.value.trim();
+  const value = cmdEl.value.trim();
   if (!value) return;
   appendLine(`hi phone ❯ ${value}`, 'ok');
   send({type: 'cmd', cmd: value});
-  cmd.value = '';
+  cmdEl.value = '';
 });
 window.addEventListener('load', () => {
-  connectSSH();
-  cmd.focus();
+  connect();
+  cmdEl.focus();
 });
-
-function swipe(dir) {
-  const cmds = {
-    up:    'input swipe 540 1400 540 400 300',
-    down:  'input swipe 540 400 540 1400 300',
-    left:  'input swipe 900 760 100 760 300',
-    right: 'input swipe 100 760 900 760 300',
-  };
-  send({type: 'cmd', cmd: 'su -c "' + cmds[dir] + '"'});
-}
-function key(code) {
-  send({type: 'cmd', cmd: 'input keyevent ' + code});
-}
-
 </script>
-
-  <div id="controls">
-    <div class="ctrl-label">swipe</div>
-    <div class="ctrl-row">
-      <button class="ctrl-btn" onclick="swipe('up')">↑ up</button>
-    </div>
-    <div class="ctrl-row">
-      <button class="ctrl-btn" onclick="swipe('left')">← left</button>
-      <button class="ctrl-btn" onclick="swipe('down')">↓ down</button>
-      <button class="ctrl-btn" onclick="swipe('right')">→ right</button>
-    </div>
-    <div class="ctrl-label" style="margin-top:4px">buttons</div>
-    <div class="ctrl-row">
-      <button class="ctrl-btn" onclick="key('KEYCODE_VOLUME_UP')">vol +</button>
-      <button class="ctrl-btn" onclick="key('KEYCODE_VOLUME_DOWN')">vol −</button>
-      <button class="ctrl-btn" onclick="key('KEYCODE_POWER')">power</button>
-      <button class="ctrl-btn" onclick="key('KEYCODE_BACK')">back</button>
-      <button class="ctrl-btn" onclick="key('KEYCODE_HOME')">home</button>
-    </div>
-  </div>
-
 </body>
 </html>
 '''
 
+ACTIONS = {
+    "up": "input swipe 540 1800 540 400",
+    "down": "input swipe 540 400 540 1800",
+    "left": "input swipe 900 1196 100 1196",
+    "right": "input swipe 100 1196 900 1196",
+    "volup": "input keyevent KEYCODE_VOLUME_UP",
+    "voldown": "input keyevent KEYCODE_VOLUME_DOWN",
+    "power": "input keyevent KEYCODE_POWER",
+    "back": "input keyevent KEYCODE_BACK",
+    "home": "input keyevent KEYCODE_HOME",
+}
+
+
 class ReuseTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
-
-
-def b64_sha1_accept(key: str) -> str:
-    raw = (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
-    return base64.b64encode(hashlib.sha1(raw).digest()).decode()
-
-
-def ws_send(sock, text: str) -> None:
-    data = text.encode("utf-8")
-    header = bytearray([0x81])
-    size = len(data)
-    if size < 126:
-        header.append(size)
-    elif size < 65536:
-        header.extend([126, (size >> 8) & 0xFF, size & 0xFF])
-    else:
-        header.append(127)
-        header.extend(size.to_bytes(8, "big"))
-    sock.sendall(header + data)
-
-
-def ws_recv(sock):
-    first = sock.recv(2)
-    if not first:
-        return None
-    b1, b2 = first
-    length = b2 & 0x7F
-    if length == 126:
-        length = int.from_bytes(sock.recv(2), "big")
-    elif length == 127:
-        length = int.from_bytes(sock.recv(8), "big")
-    mask = sock.recv(4)
-    payload = bytearray()
-    while len(payload) < length:
-        chunk = sock.recv(length - len(payload))
-        if not chunk:
-            return None
-        payload.extend(chunk)
-    for i in range(length):
-        payload[i] ^= mask[i % 4]
-    opcode = b1 & 0x0F
-    if opcode == 0x8:
-        return None
-    if opcode == 0x9:
-        sock.sendall(b"\x8A\x00")
-        return ""
-    return payload.decode("utf-8", errors="replace")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -390,161 +375,98 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return
 
 
-async def stream_pipe(pipe, sock, kind):
-    while True:
-        line = await pipe.readline()
-        if not line:
-            break
-        text = line.decode("utf-8", errors="replace").rstrip("\n")
-        ws_send(sock, json.dumps({"kind": kind, "data": text}))
-
-
-async def launch_scrcpy():
-    proc = await asyncio.create_subprocess_exec(
-        "scrcpy",
-        "-s",
-        ADB_SERIAL,
-        "--stay-awake",
-        "--video-encoder=c2.android.avc.encoder",
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    return proc
-
-
-def open_chrome_app():
-    subprocess.Popen(
-        [
-            "open",
-            "-na",
-            "Brave Browser",
-            "--args",
-            f"--app={APP_URL}",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
 def run_http():
     with ReuseTCPServer(("127.0.0.1", HTTP_PORT), Handler) as httpd:
         httpd.serve_forever()
 
 
-async def handle_client(sock):
-    ssh_cmd = [
-        "ssh",
-        "-i",
-        SSH_KEY,
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "ServerAliveInterval=30",
-        "-p",
-        PHONE_PORT,
-        f"{PHONE_USER}@{PHONE_IP}",
-    ]
+def adb_connect():
+    subprocess.run(
+        ["adb", "connect", ADB_SERIAL],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def launch_scrcpy():
+    subprocess.Popen(SCRCPY_CMD, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def launch_brave():
+    subprocess.Popen(BRAVE_CMD, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+async def send_line(ws: WebSocketServerProtocol, kind: str, text: str):
+    await ws.send(json.dumps({"kind": kind, "data": text}))
+
+
+async def pump_stream(ws: WebSocketServerProtocol, stream, kind: str):
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        await send_line(ws, kind, line.decode("utf-8", errors="replace").rstrip("\n"))
+
+
+async def handle_ws(ws: WebSocketServerProtocol):
     proc = await asyncio.create_subprocess_exec(
-        *ssh_cmd,
+        *SSH_CMD,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout_task = asyncio.create_task(stream_pipe(proc.stdout, sock, "out"))
-    stderr_task = asyncio.create_task(stream_pipe(proc.stderr, sock, "err"))
-    ws_send(sock, json.dumps({"kind": "info", "data": "hi phone shell ready"}))
+    stdout_task = asyncio.create_task(pump_stream(ws, proc.stdout, "out"))
+    stderr_task = asyncio.create_task(pump_stream(ws, proc.stderr, "err"))
+    await send_line(ws, "info", "hi phone shell ready")
 
     try:
-        while True:
-            message = await asyncio.to_thread(ws_recv, sock)
-            if message is None:
-                break
-            if not message:
-                continue
-            data = json.loads(message)
+        async for raw in ws:
+            data = json.loads(raw)
             msg_type = data.get("type")
             if msg_type == "cmd":
-                cmd = data.get("cmd", "")
-                proc.stdin.write((cmd + "\n").encode())
+                proc.stdin.write((data.get("cmd", "") + "\n").encode())
                 await proc.stdin.drain()
+            elif msg_type == "action":
+                action = ACTIONS.get(data.get("action"))
+                if action:
+                    proc.stdin.write((action + "\n").encode())
+                    await proc.stdin.drain()
             elif msg_type == "screen":
-                await launch_scrcpy()
-                ws_send(sock, json.dumps({"kind": "ok", "data": "scrcpy launched"}))
+                launch_scrcpy()
+                await send_line(ws, "ok", "scrcpy launched")
             elif msg_type == "screenshot":
                 proc.stdin.write(b"screencap -p > /sdcard/Download/controller-shot.png\n")
                 await proc.stdin.drain()
-                ws_send(sock, json.dumps({"kind": "ok", "data": "/sdcard/Download/controller-shot.png"}))
+                await send_line(ws, "ok", "/sdcard/Download/controller-shot.png")
     finally:
-        if proc.stdin:
-            proc.stdin.close()
-        proc.terminate()
-        await proc.wait()
         stdout_task.cancel()
         stderr_task.cancel()
-        sock.close()
+        if proc.stdin:
+            proc.stdin.close()
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=3)
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
 
 
-async def ws_server():
-    server = await asyncio.start_server(handle_ws, "127.0.0.1", WS_PORT)
-    async with server:
-        await server.serve_forever()
-
-
-async def handle_ws(reader, writer):
-    req = b""
-    while b"\r\n\r\n" not in req:
-        chunk = await reader.read(4096)
-        if not chunk:
-            writer.close()
-            await writer.wait_closed()
-            return
-        req += chunk
-    headers = req.decode("utf-8", errors="replace").split("\r\n")
-    key = None
-    for line in headers:
-        if line.lower().startswith("sec-websocket-key:"):
-            key = line.split(":", 1)[1].strip()
-            break
-    if not key:
-        writer.close()
-        await writer.wait_closed()
-        return
-    response = (
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Accept: {b64_sha1_accept(key)}\r\n\r\n"
-    )
-    writer.write(response.encode("utf-8"))
-    await writer.drain()
-    sock = writer.get_extra_info("socket")
-    sock.setblocking(True)
-    await handle_client(sock)
-    writer.close()
-    await writer.wait_closed()
+async def main_async():
+    server = await websockets.serve(handle_ws, "127.0.0.1", WS_PORT, ping_interval=20, ping_timeout=20)
+    await server.wait_closed()
 
 
 def main():
+    adb_connect()
     threading.Thread(target=run_http, daemon=True).start()
-    open_chrome_app()
-    subprocess.Popen(
-        [
-            "scrcpy",
-            "-s",
-            ADB_SERIAL,
-            "--stay-awake",
-            "--video-encoder=c2.android.avc.encoder",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        asyncio.run(ws_server())
-    except KeyboardInterrupt:
-        pass
+    launch_scrcpy()
+    time.sleep(1)
+    launch_brave()
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
+    import contextlib
     main()
