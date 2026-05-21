@@ -1,0 +1,920 @@
+#!/usr/bin/env -S deno run --allow-net --allow-run --allow-read --allow-env --allow-write=/tmp/nhere-stream
+// mac-side/cockpit — nothinghere v1.2
+// Deno HTTP server :7779
+// Permissions are explicit: write is scoped to /tmp/nhere-stream only.
+
+const PORT = 7779;
+const STREAM_DIR = "/tmp/nhere-stream";
+const RECORDINGS_DIR = new URL("../recordings", import.meta.url).pathname;
+const CAPTURES_DIR = `${Deno.env.get("HOME")}/Desktop/NothingCaptures`;
+const _hostIpRaw = Deno.env.get("NHERE_HOST_IP");
+if (!_hostIpRaw) {
+  console.error([
+    "error: NHERE_HOST_IP is not set.",
+    "  fix one of:",
+    "    1) launch via:   ./mac-side/up-n        (recommended)",
+    "    2) export first: source profiles/${NHERE_PROFILE:-nothing-3a-pro}.conf && ./mac-side/cockpit",
+    "    3) inline env:   NHERE_HOST_IP=... NHERE_USER=... NHERE_KEY=... ./mac-side/cockpit",
+    "  (profile must use `export VAR=...` for source to work — see profiles/*.example.conf)",
+  ].join("\n"));
+  Deno.exit(1);
+}
+const HOST_IP = _hostIpRaw;
+const NHERE_USER = Deno.env.get("NHERE_SSH_USER") ?? Deno.env.get("NHERE_USER") ?? "";
+const NHERE_PORT = Deno.env.get("NHERE_SSH_PORT") ?? Deno.env.get("NHERE_PORT") ?? "8022";
+const NHERE_KEY  = Deno.env.get("NHERE_SSH_KEY")  ?? Deno.env.get("NHERE_KEY")  ?? (Deno.env.get("HOME") + "/.ssh/nhere_ed25519");
+const ADB_SERIAL = `${HOST_IP}:5555`;
+// UI label for the device card header. Profiles can set NHERE_DEVICE_LABEL to
+// override; falls back to the Tailscale hostname, then a generic label so the
+// cockpit works for any Android, not just the Nothing 3a Pro.
+const DEVICE_LABEL = Deno.env.get("NHERE_DEVICE_LABEL") ?? Deno.env.get("NHERE_HOST") ?? "Android Device";
+
+let relayPid: number | null = null;
+let recordingPid: number | null = null;
+let streamPid: number | null = null;
+
+function isPidAlive(pid: number | null): boolean {
+  if (pid === null) return false;
+  try { Deno.kill(pid, "SIGCONT"); return true; } catch { return false; }
+}
+function killPid(pid: number | null): void {
+  if (pid === null) return;
+  try { Deno.kill(pid, "SIGTERM"); } catch { /* dead */ }
+}
+
+async function run(cmd: string[], timeoutMs?: number): Promise<{ ok: boolean; out: string }> {
+  try {
+    const p = new Deno.Command(cmd[0], { args: cmd.slice(1), stdout: "piped", stderr: "piped" }).spawn();
+    // Timeout protection. AbortSignal alone does NOT work for adb — it ignores
+    // SIGTERM while blocked in connect() and rides out the OS TCP timeout (~75s
+    // on macOS). Force-kill with SIGKILL instead, which adb cannot ignore.
+    let killed = false;
+    let timer: number | null = null;
+    if (timeoutMs) {
+      timer = setTimeout(() => { killed = true; try { p.kill("SIGKILL"); } catch { /* already dead */ } }, timeoutMs);
+    }
+    const { success, stdout, stderr } = await p.output();
+    if (timer !== null) clearTimeout(timer);
+    const out = (new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr)).trim();
+    return { ok: success && !killed, out: killed ? `timeout after ${timeoutMs}ms\n${out}` : out };
+  } catch (e) { return { ok: false, out: String(e) }; }
+}
+
+// ── capture helpers ──────────────────────────────────────────────────────────
+interface FileInfo { name: string; size: number; mtime: number; }
+
+function jsonResponse(obj: unknown, status = 200): Response {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-cache" },
+  });
+}
+
+// Single-quote a string for safe embedding inside a `bash -c` command.
+function shq(s: string): string { return "'" + s.replace(/'/g, "'\\''") + "'"; }
+
+// Minimal HTML-escape for untrusted text (capture filenames) in the page.
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function fmtSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function contentTypeFor(p: string): string {
+  const e = p.toLowerCase();
+  if (e.endsWith(".png")) return "image/png";
+  if (e.endsWith(".jpg") || e.endsWith(".jpeg")) return "image/jpeg";
+  if (e.endsWith(".gif")) return "image/gif";
+  if (e.endsWith(".webp")) return "image/webp";
+  if (e.endsWith(".mp4")) return "video/mp4";
+  if (e.endsWith(".webm")) return "video/webm";
+  if (e.endsWith(".mov")) return "video/quicktime";
+  if (e.endsWith(".mkv")) return "video/x-matroska";
+  if (e.endsWith(".txt") || e.endsWith(".log")) return "text/plain; charset=utf-8";
+  return "application/octet-stream";
+}
+
+// Newest file in `dir` matching one of `exts`. Returns null when the directory
+// is missing or empty — a missing capture folder is a normal pre-capture state.
+async function latestFile(dir: string, exts: string[]): Promise<FileInfo | null> {
+  let best: FileInfo | null = null;
+  try {
+    for await (const entry of Deno.readDir(dir)) {
+      if (!entry.isFile) continue;
+      const lower = entry.name.toLowerCase();
+      if (!exts.some((x) => lower.endsWith(x))) continue;
+      try {
+        const st = await Deno.stat(`${dir}/${entry.name}`);
+        const m = st.mtime?.getTime() ?? 0;
+        if (!best || m > best.mtime) best = { name: entry.name, size: st.size, mtime: m };
+      } catch { /* skip unstatable entry */ }
+    }
+  } catch { /* dir missing — normal before first capture */ }
+  return best;
+}
+
+// ── adb device picker ──────────────────────────────────────────────────────
+// Returns the serial of a usable adb device, or null if none reachable.
+// Strategy:
+//   1. Scan `adb devices`. Prefer the configured Tailscale TCP serial when
+//      it's reporting "device" (handshake complete). Otherwise take the first
+//      plain-USB serial.
+//   2. Nothing usable? If TCP is stuck in "offline", `adb disconnect` then
+//      `adb connect` to clear the stale handshake (necessary because raw
+//      `adb connect` against an offline entry just hangs).
+//   3. Still nothing? Bootstrap the phone's adbd TCP listener over SSH via
+//      `nhere relay-prep`, wait for it to come up, retry the connect.
+// Bounded throughout — never hangs longer than ~12 s in the worst case.
+async function pickAdbDevice(): Promise<{ serial: string | null; reason?: string }> {
+  const scan = async (): Promise<{ tcp: string | null; usb: string | null; offlineTcp: boolean }> => {
+    const r = await run(["adb", "devices"], 2500);
+    let tcp: string | null = null, usb: string | null = null, offlineTcp = false;
+    if (!r.ok) return { tcp, usb, offlineTcp };
+    for (const line of r.out.split("\n").slice(1)) { // skip header
+      const m = line.match(/^(\S+)\s+(device|offline|unauthorized)/);
+      if (!m) continue;
+      const [, sn, state] = m;
+      if (sn === ADB_SERIAL) {
+        if (state === "device") tcp = sn;
+        else if (state === "offline") offlineTcp = true;
+      } else if (!sn.includes(":") && state === "device" && !usb) {
+        usb = sn;
+      }
+    }
+    return { tcp, usb, offlineTcp };
+  };
+
+  // Step 1: fast path — already-good device. Common case, returns in <1s.
+  let s = await scan();
+  if (s.tcp) return { serial: s.tcp };
+  if (s.usb) return { serial: s.usb };
+
+  // Step 2: local reconnect. Handles the stale-handshake case where TCP shows
+  // "offline" even though the phone is actually reachable.
+  if (s.offlineTcp) await run(["adb", "disconnect", ADB_SERIAL], 2000);
+  await run(["adb", "connect", ADB_SERIAL], 3000);
+  s = await scan();
+  if (s.tcp) return { serial: s.tcp };
+  if (s.usb) return { serial: s.usb };
+
+  // Step 3: phone-side bootstrap via SSH. nhere relay-prep enables adbd TCP
+  // on port 5555 on the phone. Only worth trying if SSH itself is reachable —
+  // if the phone is asleep or off-Tailscale, this just adds latency, so the
+  // SSH call uses a short ConnectTimeout via nhereOverSsh (4s) AND we cap
+  // total relay-prep time. After it returns, give adbd a beat then reconnect.
+  const relay = await nhereOverSsh("relay-prep");
+  if (relay.ok) {
+    await new Promise((r) => setTimeout(r, 2000));
+    await run(["adb", "disconnect", ADB_SERIAL], 2000);
+    await run(["adb", "connect", ADB_SERIAL], 3000);
+    s = await scan();
+    if (s.tcp) return { serial: s.tcp };
+    if (s.usb) return { serial: s.usb };
+  }
+
+  return {
+    serial: null,
+    reason: relay.ok
+      ? `relay-prep succeeded but adb still cannot reach ${ADB_SERIAL}; check phone`
+      : `no adb device reachable. SSH to phone also failed (${relay.out.split("\n")[0] || "timeout"}). Phone may be asleep or off Tailscale.`,
+  };
+}
+
+// ── nhere control plane ──────────────────────────────────────────────────────
+// Whitelist of nhere sub-commands the cockpit will execute. Defense-in-depth
+// against any future code that might forward an HTTP path or user input.
+const NHERE_ALLOWED = new Set(["status", "arm", "disarm", "relay-prep"]);
+
+type NherePath = "ssh" | "adb" | "none";
+interface NhereResult { ok: boolean; out: string; path: NherePath; err?: string; }
+
+async function nhereOverSsh(sub: string): Promise<NhereResult> {
+  if (!NHERE_ALLOWED.has(sub)) return { ok:false, out:"", path:"ssh", err:"disallowed: " + sub };
+  // Args are passed as a Deno argv array; only the trailing `su -c 'nhere <sub>'`
+  // is a single string interpreted by the remote shell. `sub` is allowlisted, so
+  // no injection vector exists.
+  const r = await run(["ssh","-i",NHERE_KEY,"-o","BatchMode=yes","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=6","-p",NHERE_PORT,`${NHERE_USER}@${HOST_IP}`,`su -c 'nhere ${sub}'`]);
+  return { ok: r.ok, out: r.out, path: "ssh" };
+}
+
+async function nhereOverAdb(sub: string): Promise<NhereResult> {
+  if (!NHERE_ALLOWED.has(sub)) return { ok:false, out:"", path:"adb", err:"disallowed: " + sub };
+  // Best-effort reconnect; harmless when already connected.
+  await run(["adb","connect",ADB_SERIAL]);
+  // adb shell joins its trailing argv into a remote shell command. `sub` is
+  // allowlisted; no injection.
+  const r = await run(["adb","-s",ADB_SERIAL,"shell","su","-c",`nhere ${sub}`]);
+  return { ok: r.ok, out: r.out, path: "adb" };
+}
+
+// Control-path safety: SSH-first, ADB fallback. Returns the path that worked
+// so callers/UI can show it to the operator.
+async function nhereSafe(sub: string): Promise<NhereResult> {
+  if (!NHERE_ALLOWED.has(sub)) return { ok:false, out:"", path:"none", err:"disallowed: " + sub };
+  const s = await nhereOverSsh(sub);
+  if (s.ok) return s;
+  const a = await nhereOverAdb(sub);
+  if (a.ok) return a;
+  return {
+    ok: false,
+    path: "none",
+    out: `--- ssh ---\n${s.out}\n--- adb ---\n${a.out}`,
+    err: "both ssh and adb failed",
+  };
+}
+
+async function getStatus(): Promise<Record<string, string>> {
+  // Status uses the same safe runner so the cockpit stays informative even
+  // after OFF (when SSH is intentionally down but ADB fallback may be up).
+  const r = await nhereSafe("status");
+  const fields: Record<string, string> = {};
+  fields["target"] = `${NHERE_USER}@${HOST_IP}:${NHERE_PORT}`;
+  fields["via"] = r.path;
+  if (r.ok) {
+    for (const line of r.out.split("\n")) {
+      const m = line.match(/^(\w+):\s+(.+)$/);
+      if (m) fields[m[1]] = m[2];
+    }
+  } else {
+    fields["state"] = "unreachable";
+    fields["error"] = (r.out || r.err || "").slice(0, 200);
+  }
+  return fields;
+}
+
+async function scrcpyInstalled(): Promise<boolean> {
+  return (await run(["which", "scrcpy"])).ok;
+}
+
+async function startStream(): Promise<string> {
+  if (isPidAlive(streamPid)) return `ok pid=${streamPid}`;
+  try { await Deno.mkdir(STREAM_DIR, { recursive: true }); } catch { /**/ }
+  for await (const e of Deno.readDir(STREAM_DIR)) {
+    if (e.name.endsWith(".ts") || e.name.endsWith(".m3u8")) {
+      try { await Deno.remove(`${STREAM_DIR}/${e.name}`); } catch { /**/ }
+    }
+  }
+  const adb = new Deno.Command("adb", {
+    args: ["-s", ADB_SERIAL, "exec-out", "screenrecord", "--output-format=h264", "--time-limit=3600", "-"],
+    stdout: "piped", stderr: "null",
+  }).spawn();
+  const ff = new Deno.Command("ffmpeg", {
+    args: ["-re","-i","pipe:0","-c:v","libx264","-preset","ultrafast","-tune","zerolatency","-vf","scale=540:-2","-f","hls","-hls_time","1","-hls_list_size","4","-hls_flags","delete_segments+omit_endlist",`${STREAM_DIR}/stream.m3u8`],
+    stdin: "piped", stdout: "null", stderr: "null",
+  }).spawn();
+  adb.stdout.pipeTo(ff.stdin).catch(() => {});
+  streamPid = ff.pid;
+  ff.status.then(() => { streamPid = null; }).catch(() => { streamPid = null; });
+  adb.status.catch(() => {});
+  return `ok pid=${streamPid}`;
+}
+
+function stopStream(): void {
+  killPid(streamPid); streamPid = null;
+  (async () => {
+    try {
+      for await (const e of Deno.readDir(STREAM_DIR)) {
+        if (e.name.endsWith(".ts") || e.name.endsWith(".m3u8")) try { await Deno.remove(`${STREAM_DIR}/${e.name}`); } catch { /**/ }
+      }
+    } catch { /**/ }
+  })();
+}
+
+function buildHtml(fields: Record<string, string>, streamOn: boolean, relayAlive: boolean, recAlive: boolean, latestRec: FileInfo | null, latestShot: FileInfo | null): string {
+  const rawState = fields["state"] ?? "unknown";
+  const battery = fields["battery"] ?? "—";
+  const root = fields["root"] ?? "—";
+  const ts = fields["tailscale"] ?? "—";
+  const sshd = fields["sshd"] ?? "—";
+  const wakelock = fields["wakelock"] ?? "—";
+  const time = fields["time"] ?? "—";
+
+  // Normalise raw state → LIVE / OFF / UNKNOWN
+  const isLive    = rawState === "armed";
+  const isOff     = rawState === "disarmed";
+  const state     = isLive ? "LIVE" : isOff ? "OFF" : "UNKNOWN";
+  const bodyClass = isLive ? "state-live" : isOff ? "state-off" : "state-unknown";
+
+  // Mac-side state labels for badges
+  const screenLabel = relayAlive ? "live" : "off";
+  const streamLabel = streamOn ? "running" : "stopped";
+  const recLabel    = recAlive ? "recording" : "idle";
+
+  // ── right preview rail data ──
+  // Phone-preview badge tracks STREAM state: LIVE when streaming, OFFLINE when
+  // not, UNKNOWN only when the device itself is unreachable.
+  const streamBadge = streamOn ? "LIVE" : (state === "UNKNOWN" ? "UNKNOWN" : "OFFLINE");
+  const streamCls   = streamOn ? "live" : (state === "UNKNOWN" ? "unknown" : "off");
+
+  const recRows = (f: FileInfo) => `<div class="sg" style="margin-top:8px">
+<div class="sr"><span class="sk">file</span><span class="sv">${esc(f.name)}</span></div>
+<div class="sr"><span class="sk">time</span><span class="sv">${new Date(f.mtime).toISOString().slice(0, 19).replace("T", " ")}</span></div>
+<div class="sr"><span class="sk">size</span><span class="sv">${fmtSize(f.size)}</span></div>
+<div class="sr"><span class="sk">status</span><span class="sv${recAlive ? " up" : ""}">${recLabel}</span></div>
+</div>`;
+  const recPlayable = latestRec ? /\.(mp4|webm|mov)$/i.test(latestRec.name) : false;
+  const recBody = latestRec
+    ? (recPlayable
+        ? `<video class="rvid" controls preload="metadata" src="/captures/Movies/${encodeURIComponent(latestRec.name)}"></video>${recRows(latestRec)}`
+        : `<div class="rnote">File is not browser-playable</div>${recRows(latestRec)}`)
+    : `<div class="rnote">No recording loaded yet</div>`;
+  const shotSrc = latestShot ? `/captures/Screenshots/${encodeURIComponent(latestShot.name)}` : "";
+
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>nothinghere</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#09090b;--surface:#111113;--border:#1c1c1f;--accent:#00ff41;--accent-dim:#00b330;--warn:#f97316;--text:#e4e4e7;--dim:#71717a;--muted:#3f3f46;--r:6px;--f:'SF Mono','JetBrains Mono','Fira Code',monospace}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f);font-size:13px}
+body{display:flex;flex-direction:column;min-height:100vh}
+
+/* ── state bar (GPU-only, no JS) ── */
+body::before{content:'';display:block;height:2px;position:fixed;top:0;left:0;right:0;z-index:100;transition:opacity .5s}
+.state-live::before{background:linear-gradient(90deg,transparent 10%,var(--accent) 50%,transparent 90%);background-size:200% 100%;animation:sweep 2s ease-in-out infinite;opacity:1;box-shadow:0 0 12px 2px rgba(0,255,65,.25)}
+.state-unknown::before{background:linear-gradient(90deg,transparent,var(--warn),transparent);background-size:200% 100%;animation:sweep 3s ease-in-out infinite;opacity:.6}
+.state-off::before{background:var(--border);animation:none;opacity:.3}
+@keyframes sweep{0%{background-position:200% 0}100%{background-position:-200% 0}}
+
+/* ── lightning bolts (LIVE state, CSS-driven) ── */
+.lw{position:fixed;inset:0;pointer-events:none;z-index:1;overflow:hidden;transition:opacity .5s}
+.state-off .lw{opacity:0}.state-unknown .lw{opacity:.12}.state-live .lw{opacity:1}
+.lw svg{position:absolute;width:100%;height:100%}
+.bolt{stroke-dasharray:500;stroke-dashoffset:500;animation:draw-bolt 1.8s ease-in-out infinite}
+.bolt:nth-child(2){animation-delay:.6s;animation-duration:2.3s}
+.bolt:nth-child(3){animation-delay:1.2s;animation-duration:1.6s}
+@keyframes draw-bolt{0%{stroke-dashoffset:500;opacity:0}12%{opacity:.8}65%{stroke-dashoffset:0;opacity:.6}80%{opacity:0}100%{stroke-dashoffset:500;opacity:0}}
+
+/* ── rain (OFF state, CSS-driven) ── */
+.rw{position:fixed;inset:0;pointer-events:none;z-index:1;overflow:hidden;opacity:0;transition:opacity .6s}
+.state-off .rw{opacity:1}
+.rw::before,.rw::after{content:'';position:absolute;left:0;right:0;top:-900px;height:1800px;background-image:repeating-linear-gradient(180deg,transparent 0,transparent 30px,#09090b 30px,#09090b 70px),repeating-linear-gradient(90deg,transparent 0,transparent 43px,rgba(113,113,122,.1) 43px,rgba(113,113,122,.1) 44px,transparent 44px,transparent 107px,rgba(113,113,122,.07) 107px,rgba(113,113,122,.07) 108px,transparent 108px,transparent 157px,rgba(113,113,122,.09) 157px,rgba(113,113,122,.09) 158px,transparent 158px,transparent 200px);animation:rain 1.4s linear infinite}
+.rw::after{animation-duration:2.2s;animation-delay:-.7s;opacity:.5;background-image:repeating-linear-gradient(180deg,transparent 0,transparent 25px,#09090b 25px,#09090b 60px),repeating-linear-gradient(90deg,transparent 0,transparent 67px,rgba(113,113,122,.06) 67px,rgba(113,113,122,.06) 68px,transparent 68px,transparent 149px,rgba(113,113,122,.08) 149px,rgba(113,113,122,.08) 150px,transparent 150px,transparent 230px)}
+@keyframes rain{from{transform:translateY(0)}to{transform:translateY(900px)}}
+
+/* ── ambient glow (LIVE state, CSS-driven) ── */
+.state-live{background:radial-gradient(ellipse at 50% 0%,rgba(0,255,65,.025) 0%,var(--bg) 50%)}
+
+header{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--border);flex-shrink:0;z-index:10}
+.state-live header{border-bottom-color:rgba(0,255,65,.12)}
+header h1{font-size:14px;font-weight:500;letter-spacing:.06em;color:var(--text)}
+header h1 span{color:var(--muted);margin-right:3px;font-size:11px}
+.badge{font-size:10px;padding:2px 10px;border-radius:2px;font-weight:600;letter-spacing:.12em;transition:all .4s}
+.state-live .badge{color:var(--accent);background:rgba(0,255,65,.08);border:1px solid rgba(0,255,65,.25);box-shadow:0 0 8px rgba(0,255,65,.15)}
+.state-off .badge{color:var(--muted);background:rgba(63,63,70,.1);border:1px solid var(--border)}
+.state-unknown .badge{color:var(--warn);background:rgba(249,115,22,.08);border:1px solid rgba(249,115,22,.25)}
+.hr{display:flex;align-items:center;gap:10px}
+.ts{font-size:10px;color:var(--muted);letter-spacing:.04em}
+
+main{display:grid;grid-template-columns:264px 1fr;gap:0;flex:1;overflow:hidden}
+.left{background:var(--surface);border-right:1px solid var(--border);overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:6px}
+.sec{font-size:8px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);padding:6px 0 2px 2px;font-weight:500}
+.sec:first-child{padding-top:2px}
+.card{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px}
+.card h2{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:8px;font-weight:500}
+.sg{display:flex;flex-direction:column;gap:3px}
+.sr{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.sk{color:var(--muted);font-size:10px;white-space:nowrap}
+.sv{color:var(--dim);font-size:10px;text-align:right;word-break:break-all}
+.sv.hi{color:var(--accent)}.sv.pk{color:var(--warn)}.sv.up{color:var(--accent)}.sv.dn{color:var(--muted)}
+.br{display:flex;gap:4px;flex-wrap:wrap}
+.btn{flex:1;min-width:64px;padding:6px 8px;border-radius:3px;border:1px solid var(--border);background:transparent;color:var(--dim);font-family:var(--f);font-size:10px;cursor:pointer;transition:all .1s;white-space:nowrap;text-align:center;letter-spacing:.04em}
+.btn:hover{border-color:var(--muted);color:var(--text)}
+.btn.on{border-color:var(--accent-dim);color:var(--accent);background:rgba(0,255,65,.05)}
+.btn.off{border-color:#7f1d1d;color:#fca5a5;background:rgba(239,68,68,.05)}
+.btn.off:hover{border-color:#ef4444;color:#fecaca}
+.scl{display:flex;flex-direction:column;gap:2px}
+.sc{display:flex;justify-content:space-between;align-items:center}
+.sck{font-size:9px;padding:1px 5px;border-radius:2px;background:var(--border);color:var(--dim);font-weight:500}
+.scl2{font-size:9px;color:var(--muted)}
+.mid{display:flex;flex-direction:column;background:var(--bg);overflow:hidden;position:relative}
+.sh{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid var(--border);flex-shrink:0}
+.st{font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.sa{display:flex;gap:4px}
+.vw{flex:1;display:flex;align-items:center;justify-content:center;position:relative;min-height:0;background:#050505}
+video{max-width:100%;max-height:100%;display:block;object-fit:contain}
+/* Streaming-offline overlay — scoped to .vw so the bare ".off" class on
+   preview cards / badges / frames / buttons doesn't accidentally inherit
+   position:absolute and stretch over the whole strip. */
+.vw > .off{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);font-size:12px;position:absolute;inset:0;pointer-events:none}
+.vw > .off svg{opacity:.15}.vw > .off span{opacity:.35;font-size:10px}
+.fsb{position:absolute;bottom:10px;right:10px;background:rgba(255,255,255,.03);border:1px solid var(--border);color:var(--muted);border-radius:3px;padding:4px 8px;font-size:9px;font-family:var(--f);cursor:pointer;transition:all .1s;z-index:10;letter-spacing:.04em}
+.fsb:hover{border-color:var(--muted);color:var(--text)}
+::-webkit-scrollbar{width:3px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+/* ── preview strip (under the stream pane) ── */
+/* Plain flex row, explicit flex:1 1 0 per card so all three share the row
+   equally regardless of content. Grid layout was getting overridden somewhere
+   in the cascade — flex is simpler and more predictable here. */
+.strip{display:flex;flex-direction:row;gap:8px;padding:10px;border-top:1px solid var(--border);background:var(--surface);flex-shrink:0;align-items:stretch}
+.state-live .strip{border-top-color:rgba(0,255,65,.12)}
+.strip > .card{flex:1 1 0;min-width:0;display:flex;flex-direction:column}
+.pcard.live{border-color:rgba(0,255,65,.2)}
+.pcard.unknown{border-color:rgba(249,115,22,.2)}
+.rhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:8px}
+.rhead h2{margin-bottom:0}
+.pbadge{font-size:8px;letter-spacing:.12em;padding:2px 7px;border-radius:2px;font-weight:600;border:1px solid var(--border);color:var(--muted);background:rgba(63,63,70,.1);flex-shrink:0}
+.pbadge.live{color:var(--accent);background:rgba(0,255,65,.08);border-color:rgba(0,255,65,.3)}
+.pbadge.off{color:var(--muted)}
+.pbadge.unknown{color:var(--warn);background:rgba(249,115,22,.08);border-color:rgba(249,115,22,.3)}
+/* Phone-frame mini-preview lives in the strip's first card. Keep it small so
+   the whole strip stays compact under the main stream. */
+.pframe{position:relative;width:100%;max-width:120px;aspect-ratio:9/19.5;margin:0 auto 6px;background:#0a0a0c;border:1px solid var(--muted);border-radius:14px;overflow:hidden;display:flex;align-items:center;justify-content:center;transition:border-color .4s,box-shadow .4s}
+.pframe.live{border-color:var(--accent);box-shadow:0 0 10px rgba(0,255,65,.14)}
+.pframe.off{border-color:var(--muted)}
+.pframe.unknown{border-color:var(--warn)}
+.pframe::before{content:'';position:absolute;top:5px;left:50%;transform:translateX(-50%);width:26px;height:3px;border-radius:2px;background:rgba(255,255,255,.07);z-index:2}
+.pvid{width:100%;height:100%;object-fit:cover;display:block}
+.poff{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:9px;letter-spacing:.06em;text-align:center;padding:0 4px}
+.btn.wide{flex:unset;width:100%;margin-top:2px}
+.rvid{width:100%;max-height:140px;border-radius:4px;background:#000;display:block}
+.shotimg{width:100%;max-height:140px;object-fit:contain;border-radius:4px;display:block;border:1px solid var(--border);background:#000}
+.rnote{color:var(--muted);font-size:10px;text-align:center;padding:14px 4px;letter-spacing:.04em}
+</style></head><body class="${bodyClass}">
+<div class="lw" aria-hidden="true"><svg viewBox="0 0 1440 900" fill="none" xmlns="http://www.w3.org/2000/svg"><polyline class="bolt" points="200,0 260,180 230,180 310,400 270,400 380,700 340,700 420,900" stroke="#00ff41" stroke-width="1.5" stroke-linejoin="round"/><polyline class="bolt" points="900,0 950,220 920,220 1010,480 970,480 1060,900" stroke="#00ff41" stroke-width="1" stroke-linejoin="round"/><polyline class="bolt" points="1300,100 1340,300 1310,300 1380,600 1350,600 1400,900" stroke="#00ff41" stroke-width="1.2" stroke-linejoin="round"/></svg></div>
+<div class="rw" aria-hidden="true"></div>
+<header><h1><span>◈</span> nothinghere</h1><div class="hr"><span class="ts">${time.slice(11,19)} UTC</span><span class="badge">${state}</span></div></header>
+<main>
+<div class="left">
+<span class="sec">live control</span>
+<div class="card"><h2>State</h2><div class="br">
+<button class="btn${isLive?" on":""}" onclick="apiReload('/arm')">LIVE</button>
+<button class="btn${isOff?" off":""}" onclick="apiReload('/disarm')">OFF</button>
+<button class="btn" onclick="apiShow('/status')">STATUS</button>
+</div></div>
+<div class="card"><h2>Screen</h2><div class="br">
+<button class="btn${relayAlive?" on":""}" onclick="apiReload('/open-screen')">Open</button>
+<button class="btn${relayAlive?" off":""}" onclick="apiReload('/close-screen')">Close</button>
+</div></div>
+<div class="card"><h2>Stream</h2><div class="br">
+<button class="btn${streamOn?" on":""}" onclick="streamStart()">Start</button>
+<button class="btn${streamOn?" off":""}" onclick="streamStop()">Stop</button>
+<button class="btn" onclick="toggleFs()">Fullscreen</button>
+</div></div>
+<div class="card"><div class="br">
+<button class="btn" onclick="location.reload()">Refresh</button>
+<button class="btn" onclick="apiShow('/ping')">Ping</button>
+</div></div>
+<span class="sec">capture + pull</span>
+<div class="card"><h2>Record</h2><div class="br">
+<button class="btn${recAlive?" on":""}" onclick="apiReload('/record')">Record</button>
+<button class="btn${recAlive?" off":""}" onclick="apiReload('/stop-record')">Stop</button>
+<button class="btn" onclick="apiShow('/screenshot')">Screenshot</button>
+</div></div>
+<div class="card"><h2>Files</h2>
+<div class="br">
+<button class="btn" onclick="apiShow('/pull-recordings')">Pull Recordings</button>
+<button class="btn" onclick="apiShow('/pull-screenshots')">Pull Screenshots</button>
+</div>
+<div style="height:4px"></div>
+<div class="br">
+<button class="btn" onclick="apiShow('/pull-downloads')">Pull Downloads</button>
+<button class="btn" onclick="apiShow('/open-captures')">Open Folder</button>
+</div></div>
+<span class="sec">device status</span>
+<div class="card"><div class="sg">
+<div class="sr"><span class="sk">state</span><span class="sv hi">${state}</span></div>
+<div class="sr"><span class="sk">desired</span><span class="sv">${fields["desired_state"] ?? "—"}</span></div>
+<div class="sr"><span class="sk">screen</span><span class="sv${relayAlive?" up":" dn"}">${screenLabel}</span></div>
+<div class="sr"><span class="sk">stream</span><span class="sv${streamOn?" up":" dn"}">${streamLabel}</span></div>
+<div class="sr"><span class="sk">recorder</span><span class="sv${recAlive?" up":" dn"}">${recLabel}</span></div>
+<div class="sr"><span class="sk">battery</span><span class="sv${battery.includes("charging")?" pk":""}">${battery}</span></div>
+<div class="sr"><span class="sk">sshd</span><span class="sv">${sshd}</span></div>
+<div class="sr"><span class="sk">tailscale</span><span class="sv">${ts}</span></div>
+<div class="sr"><span class="sk">via</span><span class="sv${(fields["via"] ?? "")==="adb"?" pk":""}">${fields["via"] ?? "—"}</span></div>
+<div class="sr"><span class="sk">target</span><span class="sv">${fields["target"] ?? "phone"}</span></div>
+</div></div>
+<div class="card"><h2>Keys</h2><div class="scl">
+<div class="sc"><span class="sck">L</span><span class="scl2">live</span></div>
+<div class="sc"><span class="sck">O</span><span class="scl2">off</span></div>
+<div class="sc"><span class="sck">T</span><span class="scl2">status</span></div>
+<div class="sc"><span class="sck">S</span><span class="scl2">screen</span></div>
+<div class="sc"><span class="sck">X</span><span class="scl2">close</span></div>
+<div class="sc"><span class="sck">V</span><span class="scl2">stream</span></div>
+<div class="sc"><span class="sck">Q</span><span class="scl2">stop</span></div>
+<div class="sc"><span class="sck">R</span><span class="scl2">record</span></div>
+<div class="sc"><span class="sck">P</span><span class="scl2">ping</span></div>
+<div class="sc"><span class="sck">Space</span><span class="scl2">refresh</span></div>
+</div></div>
+<div class="card"><h2>Console</h2>
+<pre id="con" style="white-space:pre-wrap;word-break:break-word;font-size:10px;color:var(--dim);max-height:140px;overflow:auto;margin:0">ready</pre>
+<div style="height:4px"></div>
+<div id="err" style="font-size:10px;color:#fca5a5;white-space:pre-wrap;display:none"></div>
+</div>
+</div>
+<div class="mid">
+<div class="sh"><span class="st">${esc(DEVICE_LABEL)}</span><div class="sa"><button class="btn" style="min-width:unset;flex:unset;font-size:9px;padding:3px 8px" onclick="streamStart()">▶ stream</button></div></div>
+<div class="vw" id="vw">
+<video id="vid" autoplay muted playsinline style="${streamOn?"":"display:none"}"></video>
+<div class="off" id="op" style="${streamOn?"display:none":""}">
+<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+<span>stream offline</span><span style="font-size:9px;margin-top:2px">press V or click ▶ to start</span></div>
+<button class="fsb" onclick="toggleFs()">⛶ fullscreen</button>
+</div>
+<div class="strip">
+<div class="card pcard ${streamCls}" id="pcard">
+<div class="rhead"><h2>Phone Screen Preview</h2><span class="pbadge ${streamCls}" id="pbadge">${streamBadge}</span></div>
+<div class="pframe ${streamCls}" id="pframe">
+<video id="vidp" autoplay muted playsinline class="pvid" style="${streamOn?"":"display:none"}"></video>
+<div class="poff" id="poff" style="${streamOn?"display:none":""}">Stream offline</div>
+</div>
+<button class="btn wide" onclick="apiReload('/open-screen')">Open Screen Window</button>
+</div>
+<div class="card">
+<div class="rhead"><h2>Recording Preview</h2><span class="pbadge ${recAlive?"live":"off"}">${recAlive?"REC":"IDLE"}</span></div>
+${recBody}
+</div>
+<div class="card">
+<div class="rhead"><h2>Screenshot Preview</h2></div>
+<img id="shotImg" class="shotimg" alt="latest screenshot"${shotSrc?` src="${shotSrc}"`:` style="display:none"`}>
+<div class="rnote" id="shotEmpty"${shotSrc?` style="display:none"`:``}>No screenshot yet</div>
+<div class="br" style="margin-top:8px">
+<button class="btn" id="shotBtn" onclick="takeScreenshot(this)">Take Screenshot</button>
+<button class="btn" onclick="apiShow('/open-screenshots')">Open Folder</button>
+</div>
+</div>
+</div>
+</div></main>
+<script>
+let hls=null,hlsP=null,streamLive=${streamOn?"true":"false"};
+// One HLS instance per video element: #vid (centre, large) + #vidp (rail phone).
+function mountHls(v){
+  if(!v)return null;const src='/stream/stream.m3u8';
+  if(typeof Hls!=='undefined'&&Hls.isSupported()){
+    const h=new Hls({lowLatencyMode:true,liveSyncDurationCount:2});
+    h.loadSource(src);h.attachMedia(v);
+    h.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{}));
+    h.on(Hls.Events.ERROR,(_,d)=>{if(d.fatal)applyStreamState(false);});
+    return h;
+  }
+  if(v.canPlayType('application/vnd.apple.mpegurl')){v.src=src;v.play().catch(()=>{});}
+  return null;
+}
+function show(id,on){const el=document.getElementById(id);if(el)el.style.display=on?'':'none';}
+function setOnline(){
+  show('vid',true);show('op',false);show('vidp',true);show('poff',false);
+  if(hls)hls.destroy();hls=mountHls(document.getElementById('vid'));
+  if(hlsP)hlsP.destroy();hlsP=mountHls(document.getElementById('vidp'));
+  setPhoneBadge('LIVE','live');
+}
+function setOffline(){
+  show('vid',false);show('op',true);show('vidp',false);show('poff',true);
+  if(hls){hls.destroy();hls=null;}
+  if(hlsP){hlsP.destroy();hlsP=null;}
+  setPhoneBadge('OFFLINE','off');
+}
+function setPhoneBadge(text,cls){
+  const b=document.getElementById('pbadge'),f=document.getElementById('pframe'),c=document.getElementById('pcard');
+  if(b){b.textContent=text;b.className='pbadge '+cls;}
+  if(f)f.className='pframe '+cls;
+  if(c)c.className='card pcard '+cls;
+}
+// Single guarded entry point — only acts on a real state transition.
+function applyStreamState(alive){if(alive===streamLive)return;streamLive=alive;alive?setOnline():setOffline();}
+function logCon(msg){const el=document.getElementById('con');if(el){el.textContent=msg;el.scrollTop=el.scrollHeight;}}
+function logErr(msg){const el=document.getElementById('err');if(!el)return;if(msg){el.textContent=msg;el.style.display='';}else{el.textContent='';el.style.display='none';}}
+async function fetchText(route){
+  try{const r=await fetch(route);const t=(await r.text()).trim();if(!r.ok){logErr(route+': '+(t||r.status));return null;}logErr('');return t;}
+  catch(e){logErr(route+': '+String(e));return null;}
+}
+async function apiShow(route){logCon(route+'...');const t=await fetchText(route);if(t!==null)logCon(t);}
+async function apiReload(route){logCon(route+'...');const t=await fetchText(route);if(t!==null){logCon(t);setTimeout(()=>location.reload(),600);}}
+async function streamStart(){
+  logCon('/stream-start...');
+  const t=await fetchText('/stream-start');
+  if(!t||!t.startsWith('ok')){if(t!==null)logCon(t);return;}
+  logCon(t+'\nwaiting for manifest...');
+  // Action-scoped retry: poll the manifest every 300 ms for up to ~7 s.
+  // Runs ONLY after the user pressed Start Stream — not a global polling loop.
+  const deadline=Date.now()+7200;
+  while(Date.now()<deadline){
+    try{const r=await fetch('/stream/stream.m3u8',{cache:'no-store'});if(r.ok){logCon(t+'\nmanifest ready');logErr('');applyStreamState(true);return;}}catch{}
+    await new Promise(r=>setTimeout(r,300));
+  }
+  logErr('stream process started but manifest not ready after ~7s. Check the terminal cockpit is running in (or /tmp/cockpit.log if launched detached), then press Start Stream again.');
+}
+async function streamStop(){logCon('/stream-stop...');const t=await fetchText('/stream-stop');if(t!==null)logCon(t);applyStreamState(false);}
+async function takeScreenshot(btn){
+  const label=btn?btn.textContent:'';
+  if(btn){btn.disabled=true;btn.textContent='capturing…';}
+  logCon('/take-screenshot...');
+  try{
+    const r=await fetch('/take-screenshot',{cache:'no-store'});
+    let j=null;try{j=await r.json();}catch{}
+    logCon(j?JSON.stringify(j,null,2):('/take-screenshot: HTTP '+r.status));
+    if(r.ok&&j&&j.ok&&j.url){
+      const img=document.getElementById('shotImg'),empty=document.getElementById('shotEmpty');
+      if(img){img.src=j.url+'?t='+Date.now();img.style.display='';}
+      if(empty)empty.style.display='none';
+      logErr('');
+    }else{
+      logErr('/take-screenshot: '+((j&&(j.message||j.error))||('HTTP '+r.status)));
+    }
+  }catch(e){logErr('/take-screenshot: '+String(e));}
+  finally{if(btn){btn.disabled=false;btn.textContent=label;}}
+}
+function toggleFs(){const w=document.getElementById('vw');document.fullscreenElement?document.exitFullscreen():w.requestFullscreen().catch(()=>{});}
+// Status polling: cheap pid check every 2s keeps the live/offline badges honest.
+async function pollStream(){
+  try{const r=await fetch('/stream.json',{cache:'no-store'});if(r.ok){const j=await r.json();applyStreamState(!!j.alive);}}catch{}
+}
+setInterval(pollStream,2000);
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT')return;
+  switch(e.key.toUpperCase()){
+    case'L':apiReload('/arm');break;case'O':apiReload('/disarm');break;case'T':apiShow('/status');break;
+    case'S':apiReload('/open-screen');break;case'X':apiReload('/close-screen');break;
+    case'V':streamStart();break;case'Q':streamStop();break;
+    case'R':apiShow('/record');break;case'P':apiShow('/ping');break;
+    case' ':e.preventDefault();location.reload();break;
+  }
+});
+${streamOn?"setOnline();":""}
+</script></body></html>`;
+}
+
+async function handler(req: Request): Promise<Response> {
+  const path = new URL(req.url).pathname;
+  if (path.startsWith("/stream/")) {
+    const fpath = `${STREAM_DIR}/${path.replace("/stream/","")}`;
+    try {
+      const data = await Deno.readFile(fpath);
+      const ct = fpath.endsWith(".m3u8")?"application/vnd.apple.mpegurl":"video/mp2t";
+      return new Response(data,{headers:{"Content-Type":ct,"Cache-Control":fpath.endsWith(".m3u8")?"no-cache":"max-age=2"}});
+    } catch { return new Response("not found",{status:404}); }
+  }
+  if (path==="/stream.json") return new Response(JSON.stringify({alive:isPidAlive(streamPid),pid:streamPid}),{headers:{"Content-Type":"application/json","Cache-Control":"no-cache"}});
+  if (path==="/stream-start") return new Response(await startStream(),{headers:{"Content-Type":"text/plain"}});
+  if (path==="/stream-stop") { stopStream(); return new Response("stopped",{headers:{"Content-Type":"text/plain"}}); }
+  if (path==="/"||path==="/index.html") {
+    const fields=await getStatus();
+    const latestRec=await latestFile(`${CAPTURES_DIR}/Movies`,[".mp4",".webm",".mov",".mkv"]);
+    const latestShot=await latestFile(`${CAPTURES_DIR}/Screenshots`,[".png",".jpg",".jpeg"]);
+    return new Response(buildHtml(fields,isPidAlive(streamPid),isPidAlive(relayPid),isPidAlive(recordingPid),latestRec,latestShot),{headers:{"Content-Type":"text/html; charset=utf-8","Cache-Control":"no-cache"}});
+  }
+  if (path==="/status.json") {
+    const fields=await getStatus();
+    return new Response(JSON.stringify({raw:Object.entries(fields).map(([k,v])=>`${k}:       ${v}`).join("\n"),fields}),{headers:{"Content-Type":"application/json","Cache-Control":"no-cache"}});
+  }
+  // LIVE — try SSH first, fall back to ADB. Re-armable even after OFF as long
+  // as ADB TCP was bootstrapped before disarm (the /disarm precheck below
+  // enforces that, but ADB may also be enabled manually).
+  if (path === "/arm") {
+    const r = await nhereSafe("arm");
+    const body = `[path=${r.path}]\n${r.out || r.err || "arm ok"}`;
+    return new Response(body, { status: r.ok ? 200 : 502, headers: { "Content-Type": "text/plain" } });
+  }
+
+  // OFF — guarded. Hard rule: the cockpit must not disable its only control
+  // path. We refuse the disarm unless an ADB fallback is confirmed reachable.
+  if (path === "/disarm") {
+    let adbCheck = await nhereOverAdb("status");
+    if (!adbCheck.ok) {
+      // Try to bootstrap ADB TCP via the still-up SSH connection, then retry.
+      const relay = await nhereOverSsh("relay-prep");
+      if (relay.ok) {
+        await new Promise((r) => setTimeout(r, 2500));
+        adbCheck = await nhereOverAdb("status");
+      }
+    }
+    if (!adbCheck.ok) {
+      const msg = [
+        "OFF refused: SSH would be stopped and no ADB fallback is reachable.",
+        "Run relay-prep, connect USB ADB, or use physical Termux recovery.",
+      ].join("\n");
+      return new Response(msg, { status: 412, headers: { "Content-Type": "text/plain" } });
+    }
+    // ADB fallback confirmed. Run the actual disarm over ADB so the response
+    // path is not killed by sshd shutdown.
+    const r = await nhereOverAdb("disarm");
+    const body = `[path=${r.path}]\n${r.out || (r.ok ? "disarm ok" : "disarm failed")}`;
+    return new Response(body, { status: r.ok ? 200 : 500, headers: { "Content-Type": "text/plain" } });
+  }
+
+  // STATUS — same SSH-first / ADB-fallback contract as /arm.
+  if (path === "/status") {
+    const r = await nhereSafe("status");
+    const body = `[path=${r.path}]\n${r.out || r.err || ""}`;
+    return new Response(body, { status: r.ok ? 200 : 502, headers: { "Content-Type": "text/plain" } });
+  }
+
+  // RELAY-PREP — manual recovery: turn on ADB TCP via SSH. Useful before any
+  // OFF if the operator has not pre-armed an ADB fallback.
+  if (path === "/relay-prep") {
+    const r = await nhereSafe("relay-prep");
+    const body = `[path=${r.path}]\n${r.out || r.err || ""}`;
+    return new Response(body, { status: r.ok ? 200 : 502, headers: { "Content-Type": "text/plain" } });
+  }
+  if (path==="/ping") {
+    const r=await run(["ssh","-i",NHERE_KEY,"-o","BatchMode=yes","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=5","-p",NHERE_PORT,`${NHERE_USER}@${HOST_IP}`,"true"]);
+    return new Response(r.ok?"reachable":"unreachable",{headers:{"Content-Type":"text/plain"}});
+  }
+  if (path==="/open-screen") {
+    if (isPidAlive(relayPid)) return new Response(`relay running pid=${relayPid}`,{headers:{"Content-Type":"text/plain"}});
+    if (!(await scrcpyInstalled())) {
+      return new Response("scrcpy not installed\n  install: brew install scrcpy", {status:500, headers:{"Content-Type":"text/plain"}});
+    }
+    const pick = await pickAdbDevice();
+    if (!pick.serial) {
+      return new Response(`adb unavailable: ${pick.reason}`, {status:503, headers:{"Content-Type":"text/plain"}});
+    }
+    // Spawn detached so scrcpy does NOT block the cockpit server.
+    const p=new Deno.Command("scrcpy",{args:["-s",pick.serial,"--stay-awake","--window-title","Nothing Live","--max-size","1280","--video-bit-rate","8M"],stdout:"null",stderr:"null",stdin:"null"}).spawn();
+    relayPid=p.pid;
+    p.status.then(()=>{relayPid=null;}).catch(()=>{relayPid=null;});
+    return new Response(`ok pid=${relayPid} (device=${pick.serial})`,{headers:{"Content-Type":"text/plain"}});
+  }
+  if (path==="/close-screen") { killPid(relayPid); relayPid=null; return new Response("closed",{headers:{"Content-Type":"text/plain"}}); }
+  if (path==="/record") {
+    if (isPidAlive(recordingPid)) return new Response("already recording",{headers:{"Content-Type":"text/plain"}});
+    if (!(await scrcpyInstalled())) {
+      return new Response("scrcpy not installed\n  install: brew install scrcpy", {status:500, headers:{"Content-Type":"text/plain"}});
+    }
+    const pick=await pickAdbDevice();
+    if (!pick.serial) return new Response(`adb unavailable: ${pick.reason}`,{status:503,headers:{"Content-Type":"text/plain"}});
+    const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
+    const out=`${RECORDINGS_DIR}/rec-${ts}.mp4`;
+    const p=new Deno.Command("scrcpy",{args:["-s",pick.serial,"--no-display","--record",out],stdout:"null",stderr:"null",stdin:"null"}).spawn();
+    recordingPid=p.pid;
+    p.status.then(()=>{recordingPid=null;}).catch(()=>{recordingPid=null;});
+    return new Response(`ok ${out} (device=${pick.serial})`,{headers:{"Content-Type":"text/plain"}});
+  }
+  if (path==="/stop-record") { killPid(recordingPid); recordingPid=null; return new Response("stopped",{headers:{"Content-Type":"text/plain"}}); }
+  if (path==="/screenshot") {
+    const pick=await pickAdbDevice();
+    if (!pick.serial) return new Response(`adb unavailable: ${pick.reason}`,{status:503,headers:{"Content-Type":"text/plain"}});
+    const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
+    const out=`${RECORDINGS_DIR}/shot-${ts}.png`;
+    const p=new Deno.Command("bash",{args:["-c",`adb -s ${shq(pick.serial)} exec-out screencap -p > ${shq(out)}`],stdout:"null",stderr:"null"});
+    const {success}=await p.output();
+    return new Response(success?`ok ${out}`:"failed",{headers:{"Content-Type":"text/plain"}});
+  }
+  // ── file pull routes ──────────────────────────────────────────────────────
+  // Operator-visible capture pull. Every action logged to console.
+  if (path==="/pull-recordings") {
+    const dir=`${CAPTURES_DIR}/Movies`;
+    await run(["mkdir","-p",dir]);
+    const pick=await pickAdbDevice();
+    if (!pick.serial) return new Response(`adb unavailable: ${pick.reason}`,{status:503,headers:{"Content-Type":"text/plain"}});
+    const r=await run(["adb","-s",pick.serial,"pull","/sdcard/Movies/",dir+"/"]);
+    return new Response(r.ok?`pulled → ${dir}\n${r.out}`:`pull failed\n${r.out}`,{status:r.ok?200:500,headers:{"Content-Type":"text/plain"}});
+  }
+  if (path==="/pull-screenshots") {
+    const dir=`${CAPTURES_DIR}/Screenshots`;
+    await run(["mkdir","-p",dir]);
+    const pick=await pickAdbDevice();
+    if (!pick.serial) return new Response(`adb unavailable: ${pick.reason}`,{status:503,headers:{"Content-Type":"text/plain"}});
+    const r=await run(["adb","-s",pick.serial,"pull","/sdcard/Pictures/Screenshots/",dir+"/"]);
+    return new Response(r.ok?`pulled → ${dir}\n${r.out}`:`pull failed\n${r.out}`,{status:r.ok?200:500,headers:{"Content-Type":"text/plain"}});
+  }
+  if (path==="/pull-downloads") {
+    const dir=`${CAPTURES_DIR}/Download`;
+    await run(["mkdir","-p",dir]);
+    const pick=await pickAdbDevice();
+    if (!pick.serial) return new Response(`adb unavailable: ${pick.reason}`,{status:503,headers:{"Content-Type":"text/plain"}});
+    const r=await run(["adb","-s",pick.serial,"pull","/sdcard/Download/",dir+"/"]);
+    return new Response(r.ok?`pulled → ${dir}\n${r.out}`:`pull failed\n${r.out}`,{status:r.ok?200:500,headers:{"Content-Type":"text/plain"}});
+  }
+  if (path==="/open-captures") {
+    await run(["mkdir","-p",CAPTURES_DIR]);
+    const r=await run(["open",CAPTURES_DIR]);
+    return new Response(r.ok?`opened ${CAPTURES_DIR}`:`failed\n${r.out}`,{headers:{"Content-Type":"text/plain"}});
+  }
+  if (path==="/open-screenshots") {
+    const dir=`${CAPTURES_DIR}/Screenshots`;
+    await run(["mkdir","-p",dir]);
+    const r=await run(["open",dir]);
+    return new Response(r.ok?`opened ${dir}`:`failed\n${r.out}`,{headers:{"Content-Type":"text/plain"}});
+  }
+  // ── screenshot capture ────────────────────────────────────────────────────
+  // Fast path: `adb exec-out screencap -p` writes the PNG straight to the Mac.
+  // The redirection is done by bash (a subprocess), so it is not gated by
+  // Deno's --allow-write scope. 15s timeout guards a wedged device.
+  if (path==="/take-screenshot") {
+    const macState = () => ({
+      stream: isPidAlive(streamPid),
+      screen: isPidAlive(relayPid),
+      recorder: isPidAlive(recordingPid),
+      captures_dir: CAPTURES_DIR,
+    });
+    const pick=await pickAdbDevice();
+    if (!pick.serial) {
+      return jsonResponse({ok:false,message:"adb device not connected",error:pick.reason,state:macState()},503);
+    }
+    const dir=`${CAPTURES_DIR}/Screenshots`;
+    await run(["mkdir","-p",dir]);
+    const d=new Date();
+    const p2=(n:number)=>String(n).padStart(2,"0");
+    const stamp=`${d.getFullYear()}${p2(d.getMonth()+1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+    const name=`screenshot_${stamp}.png`;
+    const out=`${dir}/${name}`;
+    const cap=await run(["bash","-c",`adb -s ${shq(pick.serial)} exec-out screencap -p > ${shq(out)}`],15000);
+    let size=0;
+    try { size=(await Deno.stat(out)).size; } catch { /* not written */ }
+    // Verify a full PNG: 8-byte signature at the start AND the 8-byte IEND
+    // chunk at the end. Guards against a truncated `screencap -p` that would
+    // otherwise be cached as a "good" screenshot.
+    let validPng=false;
+    if (size>=24) {
+      const sigBuf=new Uint8Array(8), endBuf=new Uint8Array(8);
+      try {
+        const f=await Deno.open(out,{read:true});
+        try {
+          await f.read(sigBuf);
+          await f.seek(-8,Deno.SeekMode.End);
+          await f.read(endBuf);
+        } finally { f.close(); }
+        const sigOk=sigBuf[0]===0x89&&sigBuf[1]===0x50&&sigBuf[2]===0x4e&&sigBuf[3]===0x47&&sigBuf[4]===0x0d&&sigBuf[5]===0x0a&&sigBuf[6]===0x1a&&sigBuf[7]===0x0a;
+        // IEND chunk layout (last 12 bytes): 4B length, 4B "IEND" type, 4B CRC.
+        // We read 8 bytes from offset -8, so type bytes land at [0..3].
+        const endOk=endBuf[0]===0x49&&endBuf[1]===0x45&&endBuf[2]===0x4e&&endBuf[3]===0x44;
+        validPng=sigOk&&endOk;
+      } catch { /* leave validPng=false */ }
+    }
+    if (!cap.ok || !validPng) {
+      try { if (size===0) await Deno.remove(out); } catch { /* best-effort */ }
+      return jsonResponse({ok:false,message:"screenshot capture failed",error:cap.out||(size===0?"empty output file":"output is not a complete PNG"),state:{...macState(),size}},500);
+    }
+    return jsonResponse({
+      ok:true,
+      message:"Screenshot captured",
+      file:out,
+      url:`/captures/Screenshots/${encodeURIComponent(name)}`,
+      state:{...macState(),size},
+    });
+  }
+  // ── static capture serving ────────────────────────────────────────────────
+  // Read-only. Serves regular files from CAPTURES_DIR only. Traversal is blocked
+  // by rejecting ".." segments AND verifying the resolved real path stays inside
+  // the capture root (defeats symlink escapes too).
+  if (path.startsWith("/captures/")) {
+    let rel:string;
+    try { rel=decodeURIComponent(path.slice("/captures/".length)); }
+    catch { return new Response("bad request",{status:400}); }
+    if (rel==="" || rel.includes("\0") || rel.split("/").some((s)=>s===""||s==="..")) {
+      return new Response("forbidden",{status:403});
+    }
+    let baseReal:string;
+    try { baseReal=await Deno.realPath(CAPTURES_DIR); }
+    catch { return new Response("not found",{status:404}); }
+    let real:string;
+    try { real=await Deno.realPath(`${CAPTURES_DIR}/${rel}`); }
+    catch { return new Response("not found",{status:404}); }
+    if (real!==baseReal && !real.startsWith(baseReal+"/")) {
+      return new Response("forbidden",{status:403});
+    }
+    let st:Deno.FileInfo;
+    try { st=await Deno.stat(real); }
+    catch { return new Response("not found",{status:404}); }
+    if (!st.isFile) return new Response("not found",{status:404});
+    const ct=contentTypeFor(real);
+    const size=st.size;
+    // Range support so <video> playback and seeking work (Safari requires it).
+    const rangeHeader=req.headers.get("range");
+    const m=rangeHeader?rangeHeader.match(/^bytes=(\d*)-(\d*)$/):null;
+    if (m) {
+      let start:number,end:number;
+      if (m[1]==="" && m[2]!=="") { start=Math.max(0,size-parseInt(m[2],10)); end=size-1; }
+      else { start=m[1]?parseInt(m[1],10):0; end=m[2]?parseInt(m[2],10):size-1; }
+      if (Number.isNaN(start)||Number.isNaN(end)||start>end||start<0||end>=size) {
+        return new Response("range not satisfiable",{status:416,headers:{"Content-Range":`bytes */${size}`}});
+      }
+      const f=await Deno.open(real,{read:true});
+      await f.seek(start,Deno.SeekMode.Start);
+      let remaining=end-start+1;
+      const body=new ReadableStream<Uint8Array>({
+        async pull(ctrl){
+          if (remaining<=0) { ctrl.close(); f.close(); return; }
+          const buf=new Uint8Array(Math.min(65536,remaining));
+          const n=await f.read(buf);
+          if (n===null) { ctrl.close(); f.close(); return; }
+          remaining-=n;
+          ctrl.enqueue(buf.subarray(0,n));
+        },
+        cancel(){ try { f.close(); } catch { /* already closed */ } },
+      });
+      return new Response(body,{status:206,headers:{
+        "Content-Type":ct,
+        "Content-Length":String(end-start+1),
+        "Content-Range":`bytes ${start}-${end}/${size}`,
+        "Accept-Ranges":"bytes",
+        "Cache-Control":"no-cache",
+      }});
+    }
+    const f=await Deno.open(real,{read:true});
+    return new Response(f.readable,{headers:{
+      "Content-Type":ct,
+      "Content-Length":String(size),
+      "Accept-Ranges":"bytes",
+      "Cache-Control":"no-cache",
+    }});
+  }
+  return new Response("not found",{status:404});
+}
+
+console.log(`nothinghere cockpit :${PORT}`);
+Deno.serve({port:PORT,hostname:"127.0.0.1"},handler);

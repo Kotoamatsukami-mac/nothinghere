@@ -1,89 +1,23 @@
 # nothinghere
 
-`nothinghere` is an owner-enrolled Android administration deck.
+`nothinghere` is a simple Android-to-laptop controller setup.
 
-The project has two real parts.
+The project is not meant to be a giant platform. The real goal is simple: keep a rooted Android phone reachable and easy to control from a laptop with Tailscale, SSH, Termux, and a local web UI. The laptop side runs the controller, the Android side runs the connection pieces, and the repo should stay small and obvious.
 
-**A — Mac controller.** A terminal launcher alias (`up-n`) plus a localhost
-browser cockpit. One command brings up Tailscale, starts the cockpit, connects
-ADB, starts the phone screen stream, and opens the browser. The cockpit runs
-on :7779 and provides status, screen relay (scrcpy native window), an embedded
-live phone screen (HLS in browser), recording, and screenshot.
+## Shape
 
-**B — Phone engine.** On the enrolled phone, the engine is the Magisk module
-plus the Termux runtime. The module anchors startup and service supervision.
-Termux provides the live userland services and tools. The Nothing Phone 3a Pro
-(A059P, Android 16) is profile zero — the first proven device.
+There are only two practical parts now: the `controller/` folder on the laptop side, and the Android-side setup on the phone. `controller/` contains the localhost web UI and launcher scripts that bring the control surface up, while the phone side is just the minimal connection stack needed to make the device reachable and keep it awake when required.
 
----
+## Android side
 
-## Current state (v2.1 — confirmed working)
+On the Android phone, the setup is intentionally basic: Termux, `termux-wake-lock`, `sshd`, and Tailscale. That is the connection side. The point is not to build a complicated phone framework; the point is to make the phone reachable, stable, and easy to wake into a controllable state from the laptop.
 
-| Component | Status |
-|---|---|
-| SSH over Tailscale | ✓ armed and reachable |
-| ADB over Tailscale | ✓ authorized, no USB required |
-| Cockpit :7779 | ✓ live — status, relay, record, screenshot, stream embed |
-| Screen relay (scrcpy) | ✓ native window via cockpit |
-| Embedded phone screen (HLS) | ✓ stream embed in cockpit right panel |
-| `up-n` alias + launcher | ✓ wired in ~/.zshrc, logic in mac-side/up-n |
-| `wakelock` real value | ⏳ deferred |
-| `ctl restart / wake / sleep` | ⏳ deferred |
-| `rescue` mode | ⏳ deferred |
+A practical starting flow is: install Termux, install `openssh`, enable Tailscale, run `termux-wake-lock`, start `sshd`, then use the laptop controller to connect. If extra root or Magisk pieces still exist in the repo, treat them as legacy support until the controller is fully cleaned up.
 
----
+## Controller
 
-## Quick start (current)
+The laptop controller lives in `controller/`. This is the main code path for the local web UI on localhost, the helper control script, and the one-command launcher. This is the part that should be refined and wired properly going forward.
 
-```bash
-# Start cockpit manually
-cd ~/Desktop/nothinghere
-source profiles/nothing-3a-pro.conf
-nohup env NHERE_HOST_IP="$NHERE_HOST_IP" NHERE_USER="$NHERE_USER" \
-  NHERE_PORT="$NHERE_PORT" NHERE_KEY="$NHERE_KEY" \
-  deno run --allow-net --allow-run --allow-read --allow-env \
-  --allow-write=/tmp/nhere-stream \
-  mac-side/cockpit > /tmp/cockpit.log 2>&1 &
-open http://localhost:7779
-```
+## Repo rule
 
-One command (recommended):
-```bash
-up-n   # Tailscale + cockpit + ADB + stream + browser
-```
-
----
-
-## Repo layout
-
-```
-mac-side/
-  ctl          — SSH controller (ping, status, arm, disarm, …)
-  cockpit      — Deno HTTP server :7779
-  up-n         — launcher: Tailscale + cockpit + stream + browser
-phone-side/
-  magisk-module/
-    system/bin/nhere — root command engine (arm/disarm/status/…)
-    service.sh       — boot service (one-shot arm restore, no daemon)
-    module.prop      — module identity
-profiles/
-  nothing-3a-pro.conf         — gitignored, your real values
-  nothing-3a-pro.example.conf — copy this, fill values
-docs/
-  LIVE_ACCESS.md   — operator notes, confirmed state
-  TERMUX_SETUP.md  — Termux reinstall and cleanup checklist
-build.sh     — packages phone-side/magisk-module → nhere-v2.zip
-DOCTRINE.md  — architecture doctrine (read before building)
-RUNBOOK.md   — setup steps
-```
-
----
-
-## Constraints
-
-- Owner-enrolled administration only — not a relay, not a backdoor
-- ADB debug path opens on demand, not at boot
-- No hardcoded IPs — profile-scoped values only
-- No persistent automated shell sessions
-- No Tauri until v1 control model is proven
-- Read `DOCTRINE.md` before building or patching anything
+Keep the repo lean. Prefer one controller folder, one main README, and only the minimum extra notes needed to make the Android connection side understandable. If old files or folders stop matching reality, merge or delete them instead of preserving dead architecture.

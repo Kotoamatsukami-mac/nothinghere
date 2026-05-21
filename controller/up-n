@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# up-n — bring the full nothinghere stack online from Mac
+# Tailscale (Mac) → ADB → cockpit → stream → open browser
+# Usage: up-n [--no-stream] [--no-browser]
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+# Profile-pluggable: any Android with a profiles/<name>.conf can be driven by
+# setting NHERE_PROFILE=<name>. Default preserves existing behaviour.
+PROFILE="${NHERE_PROFILE:-nothing-3a-pro}"
+source "$REPO_ROOT/profiles/${PROFILE}.conf" 2>/dev/null || { echo "profile missing: profiles/${PROFILE}.conf"; exit 1; }
+
+COCKPIT_URL="http://localhost:7779"
+ADB_SERIAL="${NHERE_HOST_IP}:5555"
+NO_STREAM=0; NO_BROWSER=0
+for arg in "$@"; do case "$arg" in --no-stream) NO_STREAM=1;; --no-browser) NO_BROWSER=1;; esac; done
+
+G='\033[32m'; Y='\033[33m'; R='\033[31m'; P='\033[35m'; C='\033[0m'
+ok()   { printf "  %-12s ${G}✓${C} %s\n" "[$1]" "$2"; }
+warn() { printf "  %-12s ${Y}~${C} %s\n" "[$1]" "$2"; }
+fail() { printf "  %-12s ${R}✗${C} %s\n" "[$1]" "$2"; }
+
+printf "\n${P}  nothinghere up-n${C}\n\n"
+
+# 1 — Mac Tailscale
+printf "  %-12s " "[tailscale]"
+if tailscale status >/dev/null 2>&1; then
+  printf "${G}✓${C} already up\n"
+else
+  printf "starting... "
+  tailscale up 2>/dev/null || sudo tailscale up 2>/dev/null || true
+  sleep 3
+  tailscale status >/dev/null 2>&1 && printf "${G}✓${C} up\n" || { printf "${Y}~${C} slow\n"; sleep 4; }
+fi
+
+# 2 — Verify phone reachable over Tailscale
+printf "  %-12s " "[phone ping]"
+if ping -c 1 -W 2 "$NHERE_HOST_IP" >/dev/null 2>&1; then
+  ok "phone ping" "$NHERE_HOST_IP reachable"
+else
+  fail "phone ping" "$NHERE_HOST_IP unreachable — is phone on?"
+  printf "\n  ${R}Cannot continue — phone not on Tailscale.${C}\n\n"; exit 1
+fi
+
+# 3 — ADB connect
+printf "  %-12s " "[adb]"
+adb connect "$ADB_SERIAL" >/dev/null 2>&1 || true
+sleep 1
+if adb -s "$ADB_SERIAL" shell echo ok >/dev/null 2>&1; then
+  ok "adb" "$ADB_SERIAL connected"
+else
+  # ADB daemon may be down — kick it via SSH
+  warn "adb" "not responding — kicking via SSH"
+  ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
+      'su -c "setprop service.adb.tcp.port 5555; stop adbd; sleep 1; start adbd"' 2>/dev/null || true
+  sleep 3
+  adb connect "$ADB_SERIAL" >/dev/null 2>&1 || true
+  adb -s "$ADB_SERIAL" shell echo ok >/dev/null 2>&1 \
+    && ok "adb" "$ADB_SERIAL connected (after kick)" \
+    || fail "adb" "still down — continuing without ADB"
+fi
+
+# 4 — Phone health check via SSH
+printf "  %-12s " "[phone health]"
+HEALTH="$(ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+    -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
+    'echo ok' 2>/dev/null || echo fail)"
+if [ "$HEALTH" = "ok" ]; then
+  STATUS="$(ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
+      "su -c 'nhere status'" 2>/dev/null)"
+  SSHD_LABEL="$(printf '%s' "$STATUS" | awk '/^sshd:/{print $2}')"
+  TS_LABEL="$(printf '%s' "$STATUS" | awk '/^tailscale:/{print $2}')"
+  BAT="$(printf '%s' "$STATUS" | awk '/^battery:/{print $2}')"
+  ok "phone health" "ssh✓  ts=${TS_LABEL:-?}  sshd=${SSHD_LABEL:-?}  bat=${BAT:-?}"
+  if [ "${SSHD_LABEL}" = "down" ] || [ "${TS_LABEL}" = "down" ]; then
+    warn "phone health" "stack incomplete — attempting nhere arm"
+    ssh -i "$NHERE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        -o ConnectTimeout=6 -p "$NHERE_PORT" "$NHERE_USER@$NHERE_HOST_IP" \
+        "su -c 'nhere arm'" 2>/dev/null || true
+    ok "phone health" "recovery attempted"
+  fi
+else
+  fail "phone health" "SSH unreachable"
+fi
+
+# 5 — Cockpit
+# Foreground-attached pattern: cockpit launches as a child of *this* shell with
+# stdout/stderr going straight to the terminal. No nohup, no disown, no log
+# redirect — closing this terminal (or Ctrl-C below) kills cockpit, so it can
+# never silently stay live. up-n itself blocks on `wait` at the very end.
+printf "  %-12s " "[cockpit]"
+COCKPIT_PID=""        # set only if THIS run started cockpit (we don't kill someone else's)
+if curl -sf --max-time 2 "$COCKPIT_URL/status.json" >/dev/null 2>&1; then
+  warn "cockpit" "already running :7779 elsewhere — this terminal will NOT own it"
+else
+  cd "$REPO_ROOT"
+  NHERE_HOST_IP="$NHERE_HOST_IP" NHERE_USER="$NHERE_USER" \
+  NHERE_PORT="$NHERE_PORT" NHERE_KEY="$NHERE_KEY" \
+  NHERE_DEVICE_LABEL="${NHERE_DEVICE_LABEL:-}" \
+  deno run \
+    --allow-net --allow-run --allow-read --allow-env --allow-write=/tmp/nhere-stream \
+    mac-side/cockpit &
+  COCKPIT_PID=$!
+  for _ in $(seq 1 12); do
+    sleep 1
+    curl -sf --max-time 1 "$COCKPIT_URL/status.json" >/dev/null 2>&1 && break
+  done
+  curl -sf --max-time 2 "$COCKPIT_URL/status.json" >/dev/null 2>&1 \
+    && ok "cockpit" "started :7779 (pid $COCKPIT_PID — Ctrl-C here stops it)" \
+    || warn "cockpit" "slow to start — see output above"
+fi
+
+# 6 — Stream
+if [ "$NO_STREAM" -eq 0 ]; then
+  printf "  %-12s " "[stream]"
+  if curl -sf --max-time 2 "$COCKPIT_URL/stream.json" 2>/dev/null | grep -q '"alive":true'; then
+    ok "stream" "already streaming"
+  else
+    curl -sf --max-time 8 "$COCKPIT_URL/stream-start" >/dev/null 2>&1 || true
+    sleep 2
+    curl -sf --max-time 2 "$COCKPIT_URL/stream.json" 2>/dev/null | grep -q '"alive":true' \
+      && ok "stream" "started" \
+      || warn "stream" "not alive yet — start from cockpit"
+  fi
+fi
+
+# 7 — Open browser
+[ "$NO_BROWSER" -eq 0 ] && open "$COCKPIT_URL" 2>/dev/null || true
+
+# Final status
+STATE="$(curl -sf --max-time 3 "$COCKPIT_URL/status.json" 2>/dev/null | grep -o '"state":"[^"]*"' | cut -d'"' -f4 || echo unknown)"
+printf "\n${P}  ready${C}  cockpit=:7779  phone=${STATE}\n"
+
+# ── Foreground attach ──────────────────────────────────────────────────────
+# If this run owns cockpit, block on it so the terminal stays bound to it.
+# Ctrl-C (SIGINT) or closing the terminal sends SIGTERM and we exit cleanly.
+# If cockpit was already running elsewhere we just exit — leaving the other
+# owner alone.
+if [ -n "$COCKPIT_PID" ]; then
+  printf "${P}  attached${C}  Ctrl-C here stops cockpit  (closing this terminal also stops it)\n\n"
+  cleanup() {
+    printf "\n  [up-n] stopping cockpit (pid %s)...\n" "$COCKPIT_PID"
+    kill "$COCKPIT_PID" 2>/dev/null || true
+    # Give deno a moment to drain, then escalate if needed.
+    for _ in 1 2 3 4 5; do
+      kill -0 "$COCKPIT_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -0 "$COCKPIT_PID" 2>/dev/null && kill -9 "$COCKPIT_PID" 2>/dev/null || true
+    exit 0
+  }
+  trap cleanup INT TERM HUP
+  # `wait` returns 128+signal under set -e — guard with || true so a clean
+  # Ctrl-C still gives a 0 exit code via the trap.
+  wait "$COCKPIT_PID" || true
+  printf "  [up-n] cockpit exited\n"
+else
+  printf "\n"
+fi
