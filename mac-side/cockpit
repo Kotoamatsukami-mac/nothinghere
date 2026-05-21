@@ -296,7 +296,7 @@ header h1 span{color:var(--muted);margin-right:3px;font-size:11px}
 .hr{display:flex;align-items:center;gap:10px}
 .ts{font-size:10px;color:var(--muted);letter-spacing:.04em}
 
-main{display:grid;grid-template-columns:264px 1fr 360px;gap:0;flex:1;overflow:hidden}
+main{display:grid;grid-template-columns:264px 1fr;gap:0;flex:1;overflow:hidden}
 .left{background:var(--surface);border-right:1px solid var(--border);overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:6px}
 .sec{font-size:8px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);padding:6px 0 2px 2px;font-weight:500}
 .sec:first-child{padding-top:2px}
@@ -329,29 +329,31 @@ video{max-width:100%;max-height:100%;display:block;object-fit:contain}
 .fsb:hover{border-color:var(--muted);color:var(--text)}
 ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 
-/* ── right preview rail ── */
-.rail{background:var(--surface);border-left:1px solid var(--border);overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px}
-.state-live .rail{border-left-color:rgba(0,255,65,.12)}
-.rail .card{display:flex;flex-direction:column}
+/* ── preview strip (under the stream pane) ── */
+.strip{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:10px;border-top:1px solid var(--border);background:var(--surface);flex-shrink:0}
+.state-live .strip{border-top-color:rgba(0,255,65,.12)}
+.strip .card{display:flex;flex-direction:column;min-width:0}
 .pcard.live{border-color:rgba(0,255,65,.2)}
 .pcard.unknown{border-color:rgba(249,115,22,.2)}
-.rhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.rhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:8px}
 .rhead h2{margin-bottom:0}
-.pbadge{font-size:8px;letter-spacing:.12em;padding:2px 7px;border-radius:2px;font-weight:600;border:1px solid var(--border);color:var(--muted);background:rgba(63,63,70,.1)}
+.pbadge{font-size:8px;letter-spacing:.12em;padding:2px 7px;border-radius:2px;font-weight:600;border:1px solid var(--border);color:var(--muted);background:rgba(63,63,70,.1);flex-shrink:0}
 .pbadge.live{color:var(--accent);background:rgba(0,255,65,.08);border-color:rgba(0,255,65,.3)}
 .pbadge.off{color:var(--muted)}
 .pbadge.unknown{color:var(--warn);background:rgba(249,115,22,.08);border-color:rgba(249,115,22,.3)}
-.pframe{position:relative;width:172px;aspect-ratio:9/19.5;margin:0 auto 10px;background:#0a0a0c;border:1px solid var(--muted);border-radius:18px;overflow:hidden;display:flex;align-items:center;justify-content:center;transition:border-color .4s,box-shadow .4s}
-.pframe.live{border-color:var(--accent);box-shadow:0 0 12px rgba(0,255,65,.14)}
+/* Phone-frame mini-preview lives in the strip's first card. Keep it small so
+   the whole strip stays compact under the main stream. */
+.pframe{position:relative;width:100%;max-width:120px;aspect-ratio:9/19.5;margin:0 auto 6px;background:#0a0a0c;border:1px solid var(--muted);border-radius:14px;overflow:hidden;display:flex;align-items:center;justify-content:center;transition:border-color .4s,box-shadow .4s}
+.pframe.live{border-color:var(--accent);box-shadow:0 0 10px rgba(0,255,65,.14)}
 .pframe.off{border-color:var(--muted)}
 .pframe.unknown{border-color:var(--warn)}
-.pframe::before{content:'';position:absolute;top:7px;left:50%;transform:translateX(-50%);width:38px;height:4px;border-radius:3px;background:rgba(255,255,255,.07);z-index:2}
+.pframe::before{content:'';position:absolute;top:5px;left:50%;transform:translateX(-50%);width:26px;height:3px;border-radius:2px;background:rgba(255,255,255,.07);z-index:2}
 .pvid{width:100%;height:100%;object-fit:cover;display:block}
-.poff{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:10px;letter-spacing:.06em}
+.poff{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:9px;letter-spacing:.06em;text-align:center;padding:0 4px}
 .btn.wide{flex:unset;width:100%;margin-top:2px}
-.rvid{width:100%;max-height:200px;border-radius:4px;background:#000;display:block}
-.shotimg{width:100%;border-radius:4px;display:block;border:1px solid var(--border)}
-.rnote{color:var(--muted);font-size:10px;text-align:center;padding:16px 4px;letter-spacing:.04em}
+.rvid{width:100%;max-height:140px;border-radius:4px;background:#000;display:block}
+.shotimg{width:100%;max-height:140px;object-fit:contain;border-radius:4px;display:block;border:1px solid var(--border);background:#000}
+.rnote{color:var(--muted);font-size:10px;text-align:center;padding:14px 4px;letter-spacing:.04em}
 </style></head><body class="${bodyClass}">
 <div class="lw" aria-hidden="true"><svg viewBox="0 0 1440 900" fill="none" xmlns="http://www.w3.org/2000/svg"><polyline class="bolt" points="200,0 260,180 230,180 310,400 270,400 380,700 340,700 420,900" stroke="#00ff41" stroke-width="1.5" stroke-linejoin="round"/><polyline class="bolt" points="900,0 950,220 920,220 1010,480 970,480 1060,900" stroke="#00ff41" stroke-width="1" stroke-linejoin="round"/><polyline class="bolt" points="1300,100 1340,300 1310,300 1380,600 1350,600 1400,900" stroke="#00ff41" stroke-width="1.2" stroke-linejoin="round"/></svg></div>
 <div class="rw" aria-hidden="true"></div>
@@ -432,8 +434,8 @@ video{max-width:100%;max-height:100%;display:block;object-fit:contain}
 <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
 <span>stream offline</span><span style="font-size:9px;margin-top:2px">press V or click ▶ to start</span></div>
 <button class="fsb" onclick="toggleFs()">⛶ fullscreen</button>
-</div></div>
-<div class="rail">
+</div>
+<div class="strip">
 <div class="card pcard ${streamCls}" id="pcard">
 <div class="rhead"><h2>Phone Screen Preview</h2><span class="pbadge ${streamCls}" id="pbadge">${streamBadge}</span></div>
 <div class="pframe ${streamCls}" id="pframe">
@@ -452,7 +454,8 @@ ${recBody}
 <div class="rnote" id="shotEmpty"${shotSrc?` style="display:none"`:``}>No screenshot yet</div>
 <div class="br" style="margin-top:8px">
 <button class="btn" id="shotBtn" onclick="takeScreenshot(this)">Take Screenshot</button>
-<button class="btn" onclick="apiShow('/open-screenshots')">Open Screenshot Folder</button>
+<button class="btn" onclick="apiShow('/open-screenshots')">Open Folder</button>
+</div>
 </div>
 </div>
 </div></main>
