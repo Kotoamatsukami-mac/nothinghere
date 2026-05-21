@@ -181,6 +181,22 @@ body::before{content:'';display:block;height:2px;position:fixed;top:0;left:0;rig
 .state-off::before{background:var(--border);animation:none;opacity:.3}
 @keyframes sweep{0%{background-position:200% 0}100%{background-position:-200% 0}}
 
+/* ── lightning bolts (LIVE state, CSS-driven) ── */
+.lw{position:fixed;inset:0;pointer-events:none;z-index:1;overflow:hidden;transition:opacity .5s}
+.state-off .lw{opacity:0}.state-unknown .lw{opacity:.12}.state-live .lw{opacity:1}
+.lw svg{position:absolute;width:100%;height:100%}
+.bolt{stroke-dasharray:500;stroke-dashoffset:500;animation:draw-bolt 1.8s ease-in-out infinite}
+.bolt:nth-child(2){animation-delay:.6s;animation-duration:2.3s}
+.bolt:nth-child(3){animation-delay:1.2s;animation-duration:1.6s}
+@keyframes draw-bolt{0%{stroke-dashoffset:500;opacity:0}12%{opacity:.8}65%{stroke-dashoffset:0;opacity:.6}80%{opacity:0}100%{stroke-dashoffset:500;opacity:0}}
+
+/* ── rain (OFF state, CSS-driven) ── */
+.rw{position:fixed;inset:0;pointer-events:none;z-index:1;overflow:hidden;opacity:0;transition:opacity .6s}
+.state-off .rw{opacity:1}
+.rw::before,.rw::after{content:'';position:absolute;left:0;right:0;top:-900px;height:1800px;background-image:repeating-linear-gradient(180deg,transparent 0,transparent 30px,#09090b 30px,#09090b 70px),repeating-linear-gradient(90deg,transparent 0,transparent 43px,rgba(113,113,122,.1) 43px,rgba(113,113,122,.1) 44px,transparent 44px,transparent 107px,rgba(113,113,122,.07) 107px,rgba(113,113,122,.07) 108px,transparent 108px,transparent 157px,rgba(113,113,122,.09) 157px,rgba(113,113,122,.09) 158px,transparent 158px,transparent 200px);animation:rain 1.4s linear infinite}
+.rw::after{animation-duration:2.2s;animation-delay:-.7s;opacity:.5;background-image:repeating-linear-gradient(180deg,transparent 0,transparent 25px,#09090b 25px,#09090b 60px),repeating-linear-gradient(90deg,transparent 0,transparent 67px,rgba(113,113,122,.06) 67px,rgba(113,113,122,.06) 68px,transparent 68px,transparent 149px,rgba(113,113,122,.08) 149px,rgba(113,113,122,.08) 150px,transparent 150px,transparent 230px)}
+@keyframes rain{from{transform:translateY(0)}to{transform:translateY(900px)}}
+
 /* ── ambient glow (LIVE state, CSS-driven) ── */
 .state-live{background:radial-gradient(ellipse at 50% 0%,rgba(0,255,65,.025) 0%,var(--bg) 50%)}
 
@@ -228,6 +244,8 @@ video{max-width:100%;max-height:100%;display:block;object-fit:contain}
 .fsb:hover{border-color:var(--muted);color:var(--text)}
 ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 </style></head><body class="${bodyClass}">
+<div class="lw" aria-hidden="true"><svg viewBox="0 0 1440 900" fill="none" xmlns="http://www.w3.org/2000/svg"><polyline class="bolt" points="200,0 260,180 230,180 310,400 270,400 380,700 340,700 420,900" stroke="#00ff41" stroke-width="1.5" stroke-linejoin="round"/><polyline class="bolt" points="900,0 950,220 920,220 1010,480 970,480 1060,900" stroke="#00ff41" stroke-width="1" stroke-linejoin="round"/><polyline class="bolt" points="1300,100 1340,300 1310,300 1380,600 1350,600 1400,900" stroke="#00ff41" stroke-width="1.2" stroke-linejoin="round"/></svg></div>
+<div class="rw" aria-hidden="true"></div>
 <header><h1><span>◈</span> nothinghere</h1><div class="hr"><span class="ts">${time.slice(11,19)} UTC</span><span class="badge">${state}</span></div></header>
 <main>
 <div class="left">
